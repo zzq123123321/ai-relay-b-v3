@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-relay-b"
+version = "3.0.0.dev0"
+description = "AI Relay B V3.0 剪贴板中继与自动续接桌面应用（从零重新开发）"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "PySide6",
+    "requests",
+    "uiautomation",
+    "comtypes",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "PyInstaller",
+]
+
+[project.scripts]
+ai-relay-b = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "live: 需要真实执行端（OpenChamber/Reasonix）或外部服务",
+    "soak: 持续运行/资源类长测",
+]
