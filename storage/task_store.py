@@ -91,6 +91,42 @@ class ClaimResult:
     recorded: TaskRecord | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduleHead:
+    """调度器事务内读取的队首（T09）。state 仅供防御复核，实际条件是 QUEUED。"""
+
+    task_key: str
+    task_id: str
+    sequence: int
+    state: str
+    active_attempt_id: str | None
+    blocked_reason: str | None
+    ingress_snapshot_json: str
+    corrupt_reasons: tuple[str, ...] = ()
+
+
+class CancelOutcome(Enum):
+    CANCELLED = "CANCELLED"
+    NOT_FOUND = "NOT_FOUND"
+    REJECTED_NOT_QUEUED = "REJECTED_NOT_QUEUED"
+    REJECTED_HAS_ATTEMPT = "REJECTED_HAS_ATTEMPT"
+
+
+@dataclass(frozen=True, slots=True)
+class CancelResult:
+    """“尚未发送”排队任务取消结果（主规格 5.3）。"""
+
+    outcome: CancelOutcome
+    task_key: str
+    state: str | None = None
+    attempt_count: int = 0
+
+
+_ATTEMPT_KINDS = frozenset(
+    ("INITIAL", "MANUAL_CONTINUE", "NEW_SESSION_RETRY", "MANUAL_RESOLUTION")
+)
+
+
 def make_task_key(peer_id: str, task_id: str) -> str:
     """前缀长度编码，保证 peer 与 task_id 之间无歧义，且 id 可含 ':'。"""
     return f"{len(peer_id)}:{peer_id}:{task_id}"
@@ -254,6 +290,199 @@ class TaskStore:
         conn = self._db.connection
         row = conn.execute(sql).fetchone()
         return self._record_from_row(row) if row is not None else None
+
+    # ---------------------------------------------------------------- scheduler primitives (T09)
+
+    def read_schedulable_head(self, conn: sqlite3.Connection) -> ScheduleHead | None:
+        """事务内读取最早 QUEUED（不含越序）。corrupt_reasons 直接携带完整性诊断。"""
+        cols = _SELECT_COLUMNS + ("active_attempt_id", "blocked_reason")
+        sql = (
+            f"SELECT {', '.join(cols)} FROM tasks"
+            " WHERE state='QUEUED' ORDER BY sequence ASC LIMIT 1"
+        )
+        row = conn.execute(sql).fetchone()
+        if row is None:
+            return None
+        values = tuple(row)
+        base_count = len(_SELECT_COLUMNS)
+        record = self._record_from_row(values[:base_count])
+        active_attempt_id = values[base_count]
+        blocked_reason = values[base_count + 1]
+        return ScheduleHead(
+            task_key=record.task_key,
+            task_id=record.task_id,
+            sequence=record.sequence,
+            state=record.state,
+            active_attempt_id=active_attempt_id,
+            blocked_reason=blocked_reason,
+            ingress_snapshot_json=record.ingress_snapshot_json,
+            corrupt_reasons=record.corrupt_reasons,
+        )
+
+    def slot_state(self, conn: sqlite3.Connection) -> tuple[bool, int, int]:
+        """全局活动槽（主规格 01.3：默认同时只允许 1 个活动任务）。
+
+        返回 (slot_busy, open_attempts, active_tasks)。OPEN 的 Attempt（无论是否正处于
+        网络等待/冷却）都占用槽；activity 权威来自 SQLite，不依赖进程内存。
+        """
+        open_attempts = int(
+            conn.execute("SELECT COUNT(*) FROM attempts WHERE state='OPEN'").fetchone()[0]
+        )
+        active_tasks = int(
+            conn.execute("SELECT COUNT(*) FROM tasks WHERE state='ACTIVE'").fetchone()[0]
+        )
+        return (open_attempts > 0, open_attempts, active_tasks)
+
+    def has_attempt_evidence(self, conn: sqlite3.Connection, task_key: str) -> bool:
+        """该 task 是否存在任何 Attempt（作为“可能已发送”的坏队首分离证据）。"""
+        row = conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_key=?", (task_key,)
+        ).fetchone()
+        return bool(row and row[0] > 0)
+
+    def active_execution_detail(self, conn: sqlite3.Connection) -> dict | None:
+        """当前活动执行信息（诊断/阻塞原因展示用）。"""
+        row = conn.execute(
+            "SELECT t.task_key, t.task_id, t.sequence, a.attempt_id, a.state, a.remote_state"
+            " FROM attempts a JOIN tasks t ON t.task_key = a.task_key"
+            " WHERE a.state='OPEN' ORDER BY t.sequence ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "task_key": row[0], "task_id": row[1], "sequence": row[2],
+            "attempt_id": row[3], "attempt_state": row[4], "remote_state": row[5],
+        }
+
+    def activate_with_attempt(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_key: str,
+        attempt_id: str,
+        kind: str,
+        authority_epoch: int,
+        execution_snapshot_json: str,
+        started_at: str,
+    ) -> bool:
+        """在同一事务内创建 Attempt 并推进 Task → ACTIVE（主规格 5.3 原子启动）。
+
+        调用方必须已持有 BEGIN IMMEDIATE 事务并先完成队首与屏障检查。仍返回 False
+        表示任务已不是 QUEUED（并发竞争丢失），本方法不留下部分 Attempt。
+        """
+        if kind not in _ATTEMPT_KINDS:
+            raise TaskStoreError(f"非法 Attempt kind：{kind!r}")
+        head = conn.execute(
+            "SELECT state, active_attempt_id FROM tasks WHERE task_key=?", (task_key,)
+        ).fetchone()
+        if head is None or head[0] != _TASK_STATE_QUEUED or head[1] is not None:
+            return False
+        conn.execute(
+            "INSERT INTO attempts (attempt_id, task_key, kind, state, authority_epoch,"
+            " execution_snapshot_json, started_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                attempt_id, task_key, kind, "OPEN", authority_epoch,
+                execution_snapshot_json, started_at,
+            ),
+        )
+        cursor = conn.execute(
+            "UPDATE tasks SET state=?, active_attempt_id=?, authority_epoch=?"
+            " WHERE task_key=? AND state=?",
+            (_TASK_STATE_ACTIVE, attempt_id, authority_epoch, task_key, _TASK_STATE_QUEUED),
+        )
+        if cursor.rowcount != 1:
+            raise TaskStoreError("创建 Attempt 后任务状态被并发改变，禁止残留半个 Attempt")
+        return True
+
+    def mark_corrupt_unsent(
+        self, conn: sqlite3.Connection, *, task_key: str, blocked_reason: str, now: str
+    ) -> None:
+        """坏队首且无发送证据：给明确本地终态（不拼凑任务），随后队列才可继续。"""
+        cursor = conn.execute(
+            "UPDATE tasks SET state=?, blocked_reason=? WHERE task_key=? AND state=?",
+            ("STOPPED_BY_USER", blocked_reason, task_key, _TASK_STATE_QUEUED),
+        )
+        if cursor.rowcount != 1:
+            raise TaskStoreError(f"坏队首本地终态写入失败：task {task_key}")
+        _ = now  # 事件时间戳由调用方统一写入 write_event
+
+    def write_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_code: str,
+        summary_zh: str,
+        ts_utc: str,
+        level: str = "INFO",
+        task_key: str | None = None,
+        attempt_id: str | None = None,
+        critical_audit: int = 0,
+    ) -> None:
+        """在调用方事务内写入调度事件。"""
+        conn.execute(
+            "INSERT INTO events (event_id, ts_utc, level, event_code, task_key, attempt_id,"
+            " summary_zh, fields_redacted_json, critical_audit)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()), ts_utc, level, event_code, task_key, attempt_id,
+                summary_zh, "{}", critical_audit,
+            ),
+        )
+
+    def cancel_queued(self, task_key: str, *, cancelled_at: str) -> CancelResult:
+        """取消“尚未发送”的排队任务（主规格 5.3）。
+
+        仅允许仍然 QUEUED 且无任何 Attempt 的任务；一旦创建 Attempt（进入发送边界）即拒绝。
+        成功后写 STOPPED_BY_USER 终态与事件，不直接删除任务；下一 FIFO 任务才可成为队首。
+        """
+        try:
+            with self._db.transaction():
+                conn = self._db.connection
+                row = conn.execute(
+                    "SELECT state, active_attempt_id FROM tasks WHERE task_key=?",
+                    (task_key,),
+                ).fetchone()
+                if row is None:
+                    return CancelResult(outcome=CancelOutcome.NOT_FOUND, task_key=task_key)
+                state, active_attempt_id = row[0], row[1]
+                if state != _TASK_STATE_QUEUED:
+                    return CancelResult(
+                        outcome=CancelOutcome.REJECTED_NOT_QUEUED,
+                        task_key=task_key, state=state,
+                    )
+                if active_attempt_id is not None:
+                    return CancelResult(
+                        outcome=CancelOutcome.REJECTED_HAS_ATTEMPT,
+                        task_key=task_key, state=state,
+                    )
+                attempt_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM attempts WHERE task_key=?", (task_key,)
+                    ).fetchone()[0]
+                )
+                if attempt_count > 0:
+                    return CancelResult(
+                        outcome=CancelOutcome.REJECTED_HAS_ATTEMPT,
+                        task_key=task_key, state=state, attempt_count=attempt_count,
+                    )
+                conn.execute(
+                    "UPDATE tasks SET state=?, blocked_reason=?"
+                    " WHERE task_key=? AND state=?",
+                    ("STOPPED_BY_USER", "queued_cancel", task_key, _TASK_STATE_QUEUED),
+                )
+                self.write_event(
+                    conn,
+                    event_code="QUEUED_CANCELLED",
+                    summary_zh="用户显式取消未发送的排队任务",
+                    ts_utc=cancelled_at,
+                    task_key=task_key,
+                )
+                return CancelResult(
+                    outcome=CancelOutcome.CANCELLED,
+                    task_key=task_key, state="STOPPED_BY_USER", attempt_count=0,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise TaskStoreError(f"取消排队任务写入失败并回滚：{exc}") from exc
 
     # ---------------------------------------------------------------- internals
 
