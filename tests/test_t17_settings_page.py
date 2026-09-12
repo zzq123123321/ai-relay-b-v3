@@ -602,3 +602,113 @@ class TestRegistryContract:
         leaves = _flatten(dict(SettingsDraft.defaults()))
         assert leaves == fields
         assert len(fields) == 62
+
+
+# ---------------------------------------------------------------- B2R2 tests
+
+class TestSessionProvenanceRefresh:
+    SESSION_DIR = "/proj"
+
+    def _setup(self):
+        page = SettingsPage(directory_picker=lambda: "/new")
+        _apply(page, CandidateKind.SESSION, ("S1", "S2"), region=_region(CandidateKind.SESSION, directory=self.SESSION_DIR))
+        return page
+
+    def _select(self, page, text):
+        idx = page.session_combo.findText(text)
+        assert idx >= 0
+        page.session_combo.setCurrentIndex(idx)
+
+    def test_selected_candidate_establishes_provenance(self):
+        page = self._setup()
+        self._select(page, "S1")
+        assert page._session_candidate_region == _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+
+    def test_removed_candidate_clears_provenance(self):
+        page = self._setup()
+        self._select(page, "S1")
+        region = _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+        assert page._session_candidate_region == region
+        _apply(page, CandidateKind.SESSION, ("S2",), region=region)
+        assert page.session_combo.currentText() == "S1"
+        assert page._session_candidate_region is None
+        assert "未出现在本次候选中" in page._session_hint_label.text()
+
+    def test_removed_candidate_survives_directory_change(self):
+        page = self._setup()
+        self._select(page, "S1")
+        region = _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+        _apply(page, CandidateKind.SESSION, ("S2",), region=region)
+        assert page._session_candidate_region is None
+        page._on_pick_directory()
+        assert page.session_combo.currentText() == "S1"
+        assert page._session_hint_label.text() == "会话待核验"
+
+    def test_still_present_candidate_keeps_provenance(self):
+        page = self._setup()
+        self._select(page, "S1")
+        region = _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+        _apply(page, CandidateKind.SESSION, ("S1", "S3"), region=region)
+        assert page._session_candidate_region == region
+
+    def test_empty_success_clears_provenance(self):
+        page = self._setup()
+        self._select(page, "S1")
+        region = _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+        _apply(page, CandidateKind.SESSION, (), region=region)
+        assert page.session_combo.currentText() == "S1"
+        assert page._session_candidate_region is None
+
+    def test_explicit_reselection_restores_provenance(self):
+        page = self._setup()
+        self._select(page, "S1")
+        region = _region(CandidateKind.SESSION, directory=self.SESSION_DIR)
+        _apply(page, CandidateKind.SESSION, ("S2",), region=region)
+        assert page._session_candidate_region is None
+        _apply(page, CandidateKind.SESSION, ("S2", "S3"), region=region)
+        self._select(page, "S2")
+        assert page._session_candidate_region == region
+
+
+class TestMetaProvenance:
+    def _apply_meta(self, page, request_id, source, error=None, metadata=()):
+        region = _region(CandidateKind.META)
+        page._pending_requests[CandidateKind.META] = CandidateRequest(
+            request_id=request_id, region=region
+        )
+        page.apply_candidate_result(
+            CandidateResult(
+                request_id=request_id, region=region, values=(), source=source, error=error, metadata=metadata
+            )
+        )
+
+    def test_success_stores_provenance(self):
+        page = SettingsPage()
+        self._apply_meta(page, "m1", "good-source", metadata=(("model", "M1"),))
+        assert page._candidate_source[CandidateKind.META] == "good-source"
+        assert "M1" in page._meta_detail.text()
+
+    def test_error_preserves_prior_and_visible(self):
+        page = SettingsPage()
+        self._apply_meta(page, "m1", "good-source", metadata=(("model", "M1"),))
+        self._apply_meta(page, "m2", "failed-source", error="offline")
+        assert page._candidate_source[CandidateKind.META] == "good-source"
+        assert "good-source" in page._candidate_source_labels[CandidateKind.META].text()
+        assert "offline" in page._meta_detail.text()
+        assert "M1" in page._meta_detail.text()
+        assert "保留上次结果" in page._meta_detail.text()
+
+    def test_error_does_not_affect_rest(self):
+        snap = _snapshot()
+        page = SettingsPage(committed_snapshot=snap)
+        page.render(fake_snapshot(config_revision="10"))
+        rev_before = page._revision_label.text()
+        page.show_save_feedback("保留下", "success")
+        page.model_combo.setCurrentText("X")
+        assert page.dirty is True
+        self._apply_meta(page, "m1", "good-source", metadata=(("model", "M1"),))
+        self._apply_meta(page, "m2", "failed-source", error="offline")
+        assert page._revision_label.text() == rev_before
+        assert page._save_feedback._text == "保留下"
+        assert page.dirty is True
+        assert page.build_draft()["openchamber"]["model"] == "X"

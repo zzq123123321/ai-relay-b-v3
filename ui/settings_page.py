@@ -704,13 +704,18 @@ class SettingsPage(QWidget):
         self._pending_requests.pop(result.region.kind, None)
 
         if result.region.kind == CandidateKind.META:
+            if result.error:
+                # 失败：不覆盖上次成功来源/metadata 事实，仅显示失败并保留上次结果
+                self._meta_detail.setText(
+                    _meta_error_text(result.error, self._meta_detail.text())
+                )
+                self._recompute_dirty()
+                return True
             self._candidate_source[CandidateKind.META] = result.source
             self._candidate_source_labels[CandidateKind.META].setText(
                 _meta_source_text(result)
             )
             self._meta_detail.setText(_meta_detail_text(result))
-            if result.error:
-                self._meta_detail.setText(f"Meta 刷新失败：{result.error}")
             self._recompute_dirty()
             return True
 
@@ -727,13 +732,19 @@ class SettingsPage(QWidget):
         self._candidate_region[result.region.kind] = result.region
 
         if result.region.kind == CandidateKind.SESSION:
-            if not result.values:
-                self._session_hint_label.setText("会话候选为空，未发现候选")
             manual = self._display_text("openchamber.session_id")
-            if manual and result.values and manual not in result.values:
-                self._session_hint_label.setText(
-                    "当前手填会话未出现在本次候选中，请核对"
-                )
+            if not manual:
+                self._session_candidate_region = None
+            elif _session_provenance_kept(
+                self._session_candidate_region, result.region, manual, result.values
+            ):
+                pass  # 之前已从候选选择、同区域且仍在新候选 → 保留 derived
+            else:
+                self._session_candidate_region = None
+                if not result.values:
+                    self._session_hint_label.setText("会话候选为空，未发现候选")
+                elif manual not in result.values:
+                    self._session_hint_label.setText("当前手填会话未出现在本次候选中，请核对")
         source = result.source or "未知来源"
         self._candidate_source_labels[result.region.kind].setText(f"候选来源：{source}")
         self._candidate_source[result.region.kind] = source
@@ -755,6 +766,23 @@ class SettingsPage(QWidget):
         policy = QFormLayout.WrapAllRows if flag else QFormLayout.DontWrapRows
         for form in self._forms:
             form.setRowWrapPolicy(policy)
+
+
+def _session_provenance_kept(prev_region, result_region, manual: str, values: tuple) -> bool:
+    """刷新成功后判断 SESSION provenance 是否应保留（仅同区域候选包含当前值）。"""
+    if prev_region is None:
+        return False
+    if prev_region != result_region:
+        return False
+    return manual in values
+
+
+def _meta_error_text(error: str, prev_detail: str) -> str:
+    """META 刷新失败时的详情文案：保留上次成功结果并追加失败信息。"""
+    text = f"Meta 刷新失败：{error}"
+    if prev_detail:
+        text += f"\n保留上次结果：\n{prev_detail}"
+    return text
 
 
 def _meta_source_text(result: CandidateResult) -> str:
