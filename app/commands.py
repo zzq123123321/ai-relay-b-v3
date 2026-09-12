@@ -17,7 +17,12 @@ from typing import Callable
 from core.domain import ReceiveSettingsSnapshot
 from core.ingress import IngressError, IngressErrorCode, IngressService
 from core.protocol_v1 import LEGACY_BEGIN, PROTOCOL_MARKER
-from core.settings_service import SettingsService
+from core.settings_service import (
+    SettingsCommitError,
+    SettingsService,
+    SettingsValidationError,
+)
+from storage.settings_store import SettingsConflictError
 from storage.task_store import ClaimOutcome
 
 
@@ -157,3 +162,134 @@ class ClipboardReceiveController:
                 error=exc.message,
             )
         return ReceiveResult(kind=ReceiveOutcomeKind.ERROR, reason=reason, error=exc.message)
+
+
+# ---------------------------------------------------------------------------
+# T17-B1：设置保存与候选刷新纯合同（不含 UI/数据库/网络）。
+# ---------------------------------------------------------------------------
+
+
+class SettingsSaveOutcomeKind(str, Enum):
+    """设置保存结果种类：上层不再用字符串做机器判断。"""
+
+    SAVED = "saved"
+    VALIDATION_ERROR = "validation_error"
+    CONFLICT = "conflict"
+    COMMIT_ERROR = "commit_error"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsSaveResult:
+    """设置保存结果：new_revision 只用于 SAVED；actual_revision 主要用于 CONFLICT。
+
+    失败语义恒定：生效配置 revision、UI/服务引用均不改变，草稿保留。
+    """
+
+    kind: SettingsSaveOutcomeKind
+    message: str
+    base_revision: int | None
+    new_revision: int | None = None
+    actual_revision: int | None = None
+
+
+def map_settings_save_error(exc: Exception, *, base_revision: int | None) -> SettingsSaveResult:
+    """把保存链路异常映射为类型化结果（B1 纯异常映射合同，B3 才有真实执行）。
+
+    所有失败 warning 必须包含“仍使用原配置”，UI-B07 依赖该稳定语义。
+    """
+    if isinstance(exc, SettingsValidationError):
+        return SettingsSaveResult(
+            kind=SettingsSaveOutcomeKind.VALIDATION_ERROR,
+            message=f"配置校验失败：{exc.message}；仍使用原配置",
+            base_revision=base_revision,
+        )
+    if isinstance(exc, SettingsConflictError):
+        return SettingsSaveResult(
+            kind=SettingsSaveOutcomeKind.CONFLICT,
+            message=(
+                "设置已被其他操作更新：数据库当前为 rev "
+                f"{exc.actual}，本页草稿基于 rev {exc.expected}；"
+                "仍使用原配置，请重新载入并核对后保存"
+            ),
+            base_revision=base_revision,
+            actual_revision=exc.actual,
+        )
+    if isinstance(exc, SettingsCommitError):
+        return SettingsSaveResult(
+            kind=SettingsSaveOutcomeKind.COMMIT_ERROR,
+            message=f"配置提交失败，当前生效配置保持不变：{exc.message}；仍使用原配置",
+            base_revision=base_revision,
+        )
+    return SettingsSaveResult(
+        kind=SettingsSaveOutcomeKind.ERROR,
+        message=f"保存设置失败：{exc}；仍使用原配置",
+        base_revision=base_revision,
+    )
+
+
+class CandidateKind(str, Enum):
+    """候选刷新区域（Krylov）。独立区域独立 pending，互不影响。"""
+
+    SESSION = "session"
+    AGENT = "agent"
+    MODEL = "model"
+    META = "meta"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRegion:
+    """候选区域身份：同一区域内的请求才可能互相覆盖（含超时丢弃）。"""
+
+    kind: CandidateKind
+    endpoint: str
+    directory: str
+    project_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRequest:
+    """一次候选刷新请求。request_id 必须非空且由调用端提供。"""
+
+    request_id: str
+    region: CandidateRegion
+
+    def __post_init__(self) -> None:
+        if not self.request_id.strip():
+            raise ValueError("request_id 不能为空")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateResult:
+    """候选刷新结果：values/metadata/source 原样保留；空列表是合法成功，不代表改 draft。
+
+    metadata 为 (key, value) 二元组序列，便于 UI 按来源分列展示（ACT18 要求标明来源）。
+    error 非空表示该区域刷新失败（仍保留完整 request 身份，可参与 stale 判断）。
+    """
+
+    request_id: str
+    region: CandidateRegion
+    values: tuple[str, ...] = ()
+    metadata: tuple[tuple[str, str], ...] = ()
+    source: str = ""
+    error: str | None = None
+
+
+def candidate_result_is_stale(
+    pending: CandidateRequest | None,
+    result: CandidateResult,
+) -> bool:
+    """唯一 stale 判定：只有三条规则，缺一不可。
+
+    1) pending 为 None → stale；
+    2) request_id 不同 → stale；
+    3) CandidateRegion 不同 → stale。
+    不比较 request_id 就放行的实现是错的；``SESSION`` 与 ``META`` 互相独立。
+    """
+    if pending is None:
+        return True
+    if pending.request_id != result.request_id:
+        return True
+    if pending.region != result.region:
+        return True
+    return False

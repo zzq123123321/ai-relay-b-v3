@@ -658,3 +658,93 @@ def queue_brief_rows(
             line += f" · {label}"
         rows.append(line)
     return tuple(rows)
+
+
+# ---------------------------------------------------------------------------
+# T17-B1：配置 revision 展示（纯函数，不 import PySide；int/str 统一归一）。
+# ---------------------------------------------------------------------------
+
+
+def _normalize_revision(value: object) -> int | None:
+    """把 revision 归一为可比较整数；无法解析返回 None（在 QWidget 之外做）。
+
+    合法：int >= 1；十进制字符串（如 "12"）。
+    非法：bool、0、负数、空白、非十进制（如 "rev10"、"-1"、"1.2"）。
+    活动任务 config_revision 可能送 "12"（str），committed 是 int，
+    12 与 "12" 必须视为同一 revision。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s.isdecimal() or len(s) > 10:
+            return None
+        return int(s) if int(s) >= 1 else None
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsRevisionPresentation:
+    headline: str
+    detail: str
+    tone: str
+    differs: bool | None  # None=无法比较/无任务
+
+
+def present_settings_revision(
+    snapshot: ApplicationSnapshot,
+    committed_revision: int | None,
+) -> SettingsRevisionPresentation:
+    """设置页『当前生效配置 rev』区块：解释设置版本与活动任务版本的关系。
+
+    - committed 无值：『尚未保存配置』（从未提交过任何配置）。
+    - 有 committed、无活动任务：显示 rev + 『当前无活动任务』。
+    - 活动任务版本与生效版本相同：differs=False，提示使用相同配置版本。
+    - 活动任务使用旧版本：differs=True，说明『新设置只影响之后接收/启动的任务』。
+    - 活动任务版本无法解析：不猜，显示『未报告有效配置版本』。
+    """
+    committed = _normalize_revision(committed_revision)
+    if committed is None:
+        return SettingsRevisionPresentation(
+            headline="尚未保存配置",
+            detail="保存后在设置页可见当前生效配置版本",
+            tone="neutral",
+            differs=None,
+        )
+
+    task = snapshot.active_task
+    active_text = task.config_revision if task is not None else None
+    active = _normalize_revision(active_text)
+
+    if task is None:
+        return SettingsRevisionPresentation(
+            headline=f"当前生效配置 rev {committed}",
+            detail="当前无活动任务",
+            tone="neutral",
+            differs=None,
+        )
+    if active is None:
+        return SettingsRevisionPresentation(
+            headline=f"当前生效配置 rev {committed}",
+            detail="当前活动任务未报告有效配置版本",
+            tone="neutral",
+            differs=None,
+        )
+    if active == committed:
+        return SettingsRevisionPresentation(
+            headline=f"当前生效配置 rev {committed}",
+            detail="当前活动任务使用相同配置版本",
+            tone="success",
+            differs=False,
+        )
+    return SettingsRevisionPresentation(
+        headline=f"当前生效配置 rev {committed}",
+        detail=(
+            f"当前活动任务仍使用 rev {active}；"
+            "新设置只影响之后接收/启动的任务"
+        ),
+        tone="recovering",
+        differs=True,
+    )
