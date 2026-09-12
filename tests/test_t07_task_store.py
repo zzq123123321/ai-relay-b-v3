@@ -78,6 +78,21 @@ def _claim(
     )
 
 
+def _event_count(db, code: str = "TASK_CLAIMED") -> int:
+    row = db.connection.execute(
+        "SELECT COUNT(*) FROM events WHERE event_code=?", (code,)
+    ).fetchone()
+    return int(row[0])
+
+
+def _next_sequence(db) -> str:
+    row = db.connection.execute(
+        "SELECT value FROM meta WHERE key='next_sequence'"
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
 @pytest.fixture
 def db(tmp_path):
     database = Database(tmp_path / "db.sqlite")
@@ -101,6 +116,16 @@ class TestClaimBasics:
             "SELECT COUNT(*) FROM tasks WHERE task_key=?", (result.task_key,)
         ).fetchone()
         assert row[0] == 1
+        # 首次成功认领：TASK_CLAIMED 事件落库（INFO，非审计级）
+        event = db.connection.execute(
+            "SELECT level, event_code, critical_audit, summary_zh FROM events"
+        ).fetchone()
+        assert event is not None
+        assert event[0] == "INFO"
+        assert event[1] == "TASK_CLAIMED"
+        assert event[2] == 0
+        assert str(result.sequence) in event[3]
+        assert _next_sequence(db) == "2"
 
     def test_sequences_monotonic(self, db, store):
         s1 = _claim(store, "a", "body")
@@ -132,23 +157,32 @@ class TestDedupConflict:
         assert rec is not None
         assert rec.body == "修复甲"
         assert rec.sequence == 1
+        # 重复认领不新增 TASK_CLAIMED，不额外消耗 next_sequence
+        assert _event_count(db) == 1
+        assert _next_sequence(db) == "2"
 
     def test_same_id_diff_hash_conflict_keeps_old(self, db, store):
         first = _claim(store, "t-1", "修改 A")
         before = store.peek_next()
         assert before is not None
         first_hash = before.canonical_hash
+        first_record = (before.raw_message, before.ingress_snapshot_json)
 
         conflict = _claim(store, "t-1", "删除 B")
         assert conflict.outcome is ClaimOutcome.CONFLICT
         after = store.peek_next()
         assert after is not None
+        # CONFLICT 逐字段保持旧记录：raw/body/hash/sequence/state/snapshot/received_at
+        assert after.raw_message == first_record[0]
+        assert after.ingress_snapshot_json == first_record[1]
         assert after.canonical_hash == first_hash
         assert after.body == "修改 A"
         assert after.sequence == before.sequence
         assert after.state == before.state
         assert after.received_at == before.received_at
         assert db.connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert _event_count(db) == 1  # CONFLICT 不新增 TASK_CLAIMED
+        assert _next_sequence(db) == "2"
 
     def test_duplicate_at_full_queue_returns_existing(self, tmp_path):
         db_full = Database(tmp_path / "db.sqlite")
@@ -177,7 +211,9 @@ class TestQuota:
             full = _claim(s, "c", "3")
             assert full.outcome is ClaimOutcome.QUEUE_FULL
             assert full.sequence is None
-            assert db_full.connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+            assert db_full.connection.execute(("SELECT COUNT(*) FROM tasks")).fetchone()[0] == 2
+            assert _event_count(db_full) == 2  # QUEUE_FULL 不新增 TASK_CLAIMED
+            assert _next_sequence(db_full) == "3"
         finally:
             db_full.close()
 
@@ -351,6 +387,15 @@ class TestCorruptRecords:
         assert rec_bad is not None
         assert any("received_at" in r for r in rec_bad.corrupt_reasons)
 
+    def test_unparseable_raw_message_flagged(self, db, store):
+        _claim(store, "a", "修复甲")
+        _claim(store, "b", "修复乙")
+        self._corrupt(db, "a", "raw_message", "not a relay message at all")
+        queued = store.list_queued()
+        assert [r.task_id for r in queued] == ["a", "b"]  # 不崩溃、不删除
+        rec_a = next(r for r in queued if r.task_id == "a")
+        assert any("无法重新解析" in r for r in rec_a.corrupt_reasons)
+
 
 class TestConcurrentClaims:
     def test_p04_concurrent_100_unique_ids(self, tmp_path):
@@ -400,6 +445,7 @@ class TestConcurrentClaims:
             assert len(queued) == n_tasks
             assert [r.sequence for r in queued] == list(range(1, n_tasks + 1))
             assert all(not r.corrupt_reasons for r in queued)
+            assert _event_count(check) == n_tasks
         finally:
             check.close()
 
@@ -449,6 +495,9 @@ class TestConcurrentClaims:
             assert len(s.list_queued()) == 1
             assert s.peek_next() is not None
             assert s.peek_next().sequence == 1
+            # 数据库最终形态：1 行 task、1 个 sequence、1 条 TASK_CLAIMED event
+            assert _event_count(check) == 1
+            assert _next_sequence(check) == "2"
         finally:
             check.close()
 
