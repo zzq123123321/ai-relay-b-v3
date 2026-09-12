@@ -38,6 +38,7 @@ from ui.status_presenter import (
     connection_presentation,
     counters,
     event_rows,
+    format_runtime,
     present_status,
     progress_presentation,
     queue_brief_rows,
@@ -297,6 +298,7 @@ class Dashboard(QWidget):
         times = f"开始/接收：{begin.strftime('%Y-%m-%d %H:%M:%S')}" if begin else "开始/接收：未知"
         if active.running_since is not None and active.running_since != begin:
             times += f"｜开始运行：{active.running_since.strftime('%H:%M:%S')}"
+        times += f"｜运行时长：{format_runtime(active.runtime_seconds)}"
         self._times_label.setText(times)
         self._config_label.setText(f"config revision:{active.config_revision or '未知'}")
 

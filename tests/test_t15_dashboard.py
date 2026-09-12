@@ -131,7 +131,8 @@ def test_no_previous_task_residue_when_empty(qapp):
 def test_three_status_cards_are_independent_blocks(qapp):
     """连接正常、续接暂停、等待数量——三个卡片必须各自表达，不合并成一个绿灯。"""
     auto = AutoResumeSnapshot(enabled=False, paused_by_user=True)
-    conn = ConnectionSnapshot(source="S1", transport_ok=True, is_stale=False)
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=True,
+                              is_stale=False)
     dash = _dash(fake_snapshot(
         connection=conn,
         auto_resume=auto,
@@ -142,6 +143,32 @@ def test_three_status_cards_are_independent_blocks(qapp):
     assert "已暂停" in dash._auto_badge.text()
     assert "等待任务：27" in dash._queue_count.text()
     assert dash.is_single_column is False
+
+
+def test_transport_ok_payload_unknown_is_not_green(qapp):
+    """transport 可达 ≠ payload 已核验：不能亮绿灯，只能"待核验"。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=None,
+                              is_stale=False)
+    dash = _dash(fake_snapshot(connection_healthy=True, connection=conn))
+    assert "待核验" in dash._conn_badge.text()
+    assert dash._conn_badge.property("tone") != "success"
+
+
+def test_transport_down_is_recovering_not_danger(qapp):
+    """普通网络问题：接口暂不可达，recovering（不做最终 danger）。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=False, is_stale=False)
+    dash = _dash(fake_snapshot(connection_healthy=False, connection=conn))
+    assert "暂不可达" in dash._conn_badge.text()
+    assert dash._conn_badge.property("tone") == "recovering"
+
+
+def test_payload_invalid_is_explicit_danger(qapp):
+    """payload_valid=False → 明确异常，danger。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=False,
+                              is_stale=False)
+    dash = _dash(fake_snapshot(connection_healthy=True, connection=conn))
+    assert "校验未通过" in dash._conn_badge.text()
+    assert dash._conn_badge.property("tone") == "danger"
 
 
 def test_stale_connection_not_green_even_when_legacy_healthy(qapp):
@@ -192,6 +219,52 @@ def test_completed_but_delivery_pending_keeps_fourth_incomplete(qapp):
     assert "✓" in stages[2]             # 前三段 done
 
 
+# ------------------------------------------------ T15R：WATCHING 恢复链语义
+
+
+def test_normal_watching_does_not_mark_chain_completed(qapp):
+    """普通 WATCHING（从未中断）→ 7 节点全 todo/neutral，不冒充已恢复。"""
+    dash = _dash(_snap(phase="WATCHING"))
+    nodes = dash.recovery_node_texts()
+    assert nodes[0].startswith("○")            # 等待网络 未走过
+    assert nodes[5].startswith("○")            # 已恢复执行 未走过
+    assert nodes[6].startswith("○")            # 冷却 未走过
+    assert "✓" not in "".join(nodes)
+
+
+def test_recovered_watching_keeps_cooldown_todo(qapp):
+    """已恢复执行：0..5 done，『冷却』(6) 仍 todo，绝不显示 ✓ 冷却。"""
+    rec = RecoverySnapshot(phase="WATCHING", interruption_id="i-7",
+                           last_real_progress_at=T, resume_total=1)
+    dash = _dash(fake_snapshot(recovery=rec))
+    nodes = dash.recovery_node_texts()
+    assert nodes[5].startswith("✓")            # 已恢复执行 done
+    assert nodes[6].startswith("○")            # 冷却 todo
+    assert "已恢复执行" in nodes[5]
+    assert "○ 冷却" in nodes[6]
+
+
+# ------------------------------------------------------------ T15R：运行时长
+
+
+def test_runtime_seconds_formatted_as_elapsed(qapp):
+    """runtime_seconds=3661 → 运行时长：01:01:01（上游权威字段，UI 只格式化）。"""
+    snap = fake_snapshot(task_id="t1", runtime_seconds=3661, received_at=T)
+    dash = _dash(snap)
+    assert "运行时长：01:01:01" in dash._times_label.text()  # noqa: SLF001
+    assert "开始/接收：2026-09-10 12:34:56" in dash._times_label.text()  # noqa: SLF001
+
+
+def test_runtime_missing_shows_unknown(qapp):
+    """无 runtime 值 → 运行时长：未知；时间信息保留不删除。"""
+    dash = _dash(fake_snapshot(
+        task_id="t1", runtime_seconds=None, received_at=T, running_since=T,
+    ))
+    text = dash._times_label.text()  # noqa: SLF001
+    assert "运行时长：未知" in text
+    assert "开始/接收" in text
+
+
 # ------------------------------------------------------------ 计数与队列
 
 
@@ -216,6 +289,26 @@ def test_queue_count_and_brief_are_separate(qapp):
     brief = dash._queue_brief.text()
     assert "摘要0" in brief
     assert "等待任务：3" not in dash._queue_count.text()  # 计数不得被摘要截短污染
+
+
+def test_queue_brief_keeps_concrete_blocked_reason(qapp):
+    """waiting 27 + 3 项摘要，第 1 项 SESSION_MISSING → 同时看到计数与具体阻塞原因。"""
+    from app.snapshots import QueueItemSnapshot
+
+    items = (
+        QueueItemSnapshot(task_id="t0", sequence=12, title="摘要0", state="BLOCKED",
+                          blocked_reason="SESSION_MISSING"),
+        QueueItemSnapshot(task_id="t1", sequence=13, title="摘要1", state="QUEUED"),
+        QueueItemSnapshot(task_id="t2", sequence=14, title="摘要2", state="QUEUED"),
+    )
+    dash = _dash(fake_snapshot(
+        waiting_task_count=27, queue_brief=items,
+        recovery=RecoverySnapshot(phase="NONE"),
+    ))
+    assert "等待任务：27" in dash._queue_count.text()
+    whole = dash._queue_brief.text()
+    assert "原会话记录缺失" in whole
+    assert "seq 12" in whole
 
 
 def test_events_at_most_six(qapp):

@@ -111,6 +111,50 @@ def test_ui_a02_also_covers_verifying_awaiting_cooldown(qapp):
     win.close()
 
 
+# ------------------------------------------------ T15R：Header/工作台 统一连接
+
+
+def test_t15r_stale_connection_never_green_in_header_nor_dashboard(qapp):
+    """legacy connection_healthy=True + 结构化 is_stale=True → Header 与工作台都不绿。"""
+    from app.snapshots import ConnectionSnapshot
+
+    snap = fake_snapshot(connection_healthy=True).replace_snapshot(
+        connection=ConnectionSnapshot(
+            source="S1", transport_ok=True, payload_valid=True,
+            last_observed_at=T, is_stale=True,
+        ),
+    )
+    win = _make(snap)
+    wb = win.workbench_page
+    assert win._conn_badge.property("tone") == "recovering"   # noqa: SLF001
+    assert "可能已过期" in win._conn_badge.text()             # noqa: SLF001
+    assert win._conn_badge.text() != "连接 正常"              # noqa: SLF001
+    assert wb._conn_badge.property("tone") == "recovering"    # noqa: SLF001
+    assert "可能已过期" in wb._conn_badge.text()
+    win.close()
+
+
+def test_t15r_header_follows_transport_down_and_payload_pending(qapp):
+    """Header 短文案跟随 authoritative headline；暂不可达/待核验都不映射成正常。"""
+    from app.snapshots import ConnectionSnapshot
+
+    down = fake_snapshot().replace_snapshot(
+        connection=ConnectionSnapshot(source="S1", transport_ok=False, is_stale=False),
+    )
+    w1 = _make(down)
+    assert w1._conn_badge.property("tone") == "recovering"  # noqa: SLF001
+    assert "暂不可达" in w1._conn_badge.text()  # noqa: SLF001
+    w1.close()
+
+    pending = fake_snapshot().replace_snapshot(
+        connection=ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=None),
+    )
+    w2 = _make(pending)
+    assert w2._conn_badge.property("tone") != "success"  # noqa: SLF001
+    assert w2._conn_badge.text() != "连接 正常"  # noqa: SLF001
+    w2.close()
+
+
 # ---------------------------------------------------------------- UI-B01
 
 
@@ -144,6 +188,9 @@ def test_ui_b01_same_dashboard_never_claims_success_before_progress(qapp):
         ),
     ))
     assert wb.recovery_headline_text() == "✓ 已恢复执行"
+    nodes = wb.recovery_node_texts()
+    assert nodes[5].startswith("✓")   # 已恢复执行 done
+    assert nodes[6].startswith("○")   # 冷却 不得标成已走过
     win.close()
 
 

@@ -81,6 +81,7 @@ class ActiveTaskSnapshot:
     running_since: datetime | None = None
     received_at: datetime | None = None
     config_revision: str | None = None
+    runtime_seconds: int | None = None   # 上游权威运行时长（UI 只格式化，不自行计时）
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +196,7 @@ def fake_snapshot(
     running_since: datetime | None = None,
     received_at: datetime | None = None,
     config_revision: str | None = None,
+    runtime_seconds: int | None = None,
     connection: ConnectionSnapshot | None = None,
     auto_resume: AutoResumeSnapshot | None = None,
     recovery: RecoverySnapshot | None = None,
@@ -223,6 +225,7 @@ def fake_snapshot(
         running_since=running_since,
         received_at=received_at,
         config_revision=config_revision,
+        runtime_seconds=runtime_seconds,
     )
     return ApplicationSnapshot(
         active_task=active,

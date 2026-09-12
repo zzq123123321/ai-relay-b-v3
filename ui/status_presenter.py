@@ -87,6 +87,19 @@ def format_timestamp(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else "—"
 
 
+def format_runtime(seconds: int | None) -> str:
+    """上游权威运行时长 → HH:MM:SS；无值返回『未知』。
+
+    UI/展示层只负责格式化，绝不自行计时（T15R：禁止 UI 推算时长）。
+    """
+    if seconds is None:
+        return "未知"
+    total = max(int(seconds), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class StatusPresentation:
     headline: str
@@ -209,7 +222,8 @@ def recovery_steps(snapshot: ApplicationSnapshot) -> tuple[RecoveryStepPresentat
     已入会话待进展→已恢复执行→冷却』。
 
     - 恢复中：当前阶段=current，之前=done，之后=todo；
-    - 已恢复执行（WATCHING 且已有真实进展）：当前阶段=done，其余 done；
+    - 已恢复执行（WATCHING + interruption_id + 真实进展）：0..5 done，冷却仍 todo；
+    - 普通 WATCHING（从未中断）：整条链全 todo（不冒充已恢复）；
     - PAUSED / BLOCKED：阶段条全量走 todo+neutral（分支状态不占节点）；
     - 无恢复上下文：全 todo（不冒充失败）。
     """
@@ -227,11 +241,26 @@ def recovery_steps(snapshot: ApplicationSnapshot) -> tuple[RecoveryStepPresentat
             for label in RECOVERY_STEP_LABELS
         )
     if phase == "WATCHING":
-        # “已恢复执行”之后：全部视为 done（真实进展已确认）
-        return tuple(
-            RecoveryStepPresentation(label=label, state="done", tone="success")
-            for label in RECOVERY_STEP_LABELS
+        recovered = (
+            recovery.interruption_id is not None
+            and recovery.last_real_progress_at is not None
         )
+        if not recovered:
+            # 普通执行（从未中断）：整条链全部 todo，不冒充“已恢复”
+            return tuple(
+                RecoveryStepPresentation(label=label, state="todo", tone="neutral")
+                for label in RECOVERY_STEP_LABELS
+            )
+        # 已恢复执行：等待网络～已恢复执行（0..5）标 done；『冷却』(6) 仍 todo，
+        # 绝不把冷却显示成已走过。
+        steps: list[RecoveryStepPresentation] = []
+        for i, label in enumerate(RECOVERY_STEP_LABELS):
+            if i < 6:
+                state, tone = "done", "success"
+            else:
+                state, tone = "todo", "neutral"
+            steps.append(RecoveryStepPresentation(label=label, state=state, tone=tone))
+        return tuple(steps)
 
     idx = _CHAIN_INDEX.get(phase)
     if idx is None:
@@ -470,17 +499,32 @@ def connection_presentation(
                 f"{observed} · {source}",
                 "recovering",
             )
-        if conn.transport_ok is False or conn.payload_valid is False:
+        if conn.payload_valid is False:
+            # 业务数据校验明确失败：明确异常展示，不做成“暂未知”
             return ConnectionPresentation(
-                "连接不可用",
-                f"{observed} · {source}",
+                "业务数据校验未通过",
+                f"{observed} · {source} · 数据异常需核查",
                 "danger",
             )
-        if conn.transport_ok is True:
+        if conn.transport_ok is False:
+            # 普通网络可达性问题：恢复性琥珀，不做最终 danger
             return ConnectionPresentation(
-                "模型/接口连接正常",
+                "接口暂不可达",
                 f"{observed} · {source}",
-                "success",
+                "recovering",
+            )
+        if conn.transport_ok is True:
+            if conn.payload_valid is True:
+                return ConnectionPresentation(
+                    "模型/接口连接正常",
+                    f"{observed} · {source}",
+                    "success",
+                )
+            # 接口可达但消息/payload 尚未验证：不能直接声称正常
+            return ConnectionPresentation(
+                "接口可达，业务状态待核验",
+                f"{observed} · {source}",
+                "neutral",
             )
         # 结构化存在但未给出明确结论 → 交给时间字段判断
         if conn.is_stale is None and conn.last_observed_at is None:
@@ -505,6 +549,24 @@ def connection_presentation(
     if snapshot.connection_healthy:
         return ConnectionPresentation("模型/接口连接正常", "连接正常", "success")
     return ConnectionPresentation("连接状态未知", "尚未连接模型/接口", "neutral")
+
+
+# 顶部 Header 的连接 Badge 短文案（由 authoritative headline 纯文本映射，
+# 不再直接读 connection_healthy；避免 Header/工作台绿灯不一致）。
+_SHORT_CONN_LABELS: dict[str, str] = {
+    "模型/接口连接正常": "连接 正常",
+    "接口未连接": "连接 异常/未知",
+    "连接状态可能已过期": "连接 可能已过期",
+    "接口暂不可达": "连接 暂不可达",
+    "接口可达，业务状态待核验": "连接 待核验",
+    "业务数据校验未通过": "连接 数据异常",
+    "连接状态未知": "连接 未知",
+}
+
+
+def connection_short_label(headline: str) -> str:
+    """Header 徽标短文案（T15R）：只对 presentation 输出做文本映射。"""
+    return _SHORT_CONN_LABELS.get(headline, headline)
 
 
 def event_rows(
@@ -554,11 +616,20 @@ def queue_brief_rows(
 ) -> tuple[str, ...]:
     """队列摘要（工作台只列前 2–3 项；计数以 waiting_task_count 为准）。
 
-    返回单行文本列表：『seq ### · 标题 · 状态』；不含阻塞原因细节。
+    每行『seq ### · 标题 · 状态』；BLOCKED 或带 blocked_reason 的项追加
+    人类可读阻塞原因（复用 BLOCKED_REASON_LABELS；未知原因回退原始 code
+    或『原因待核对』，不静默丢弃）。
     """
     items = snapshot.queue_brief[:max_rows]
     rows: list[str] = []
     for item in items:
         seq = f"seq {item.sequence}" if item.sequence is not None else "—"
-        rows.append(f"{seq} · {item.title or item.task_id or '未知任务'} · {item.state or '未知状态'}")
+        line = f"{seq} · {item.title or item.task_id or '未知任务'} · {item.state or '未知状态'}"
+        reason = item.blocked_reason
+        if item.state == "BLOCKED" or reason is not None:
+            label = BLOCKED_REASON_LABELS.get(reason) if reason else None
+            if label is None:
+                label = reason if reason else "原因待核对"
+            line += f" · {label}"
+        rows.append(line)
     return tuple(rows)

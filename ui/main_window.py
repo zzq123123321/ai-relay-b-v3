@@ -49,7 +49,11 @@ from .components import (
 )
 from .dashboard import Dashboard
 from .navigation import NavigationBar, PAGES, PAGE_IDS
-from .status_presenter import is_superseded_update
+from .status_presenter import (
+    connection_presentation,
+    connection_short_label,
+    is_superseded_update,
+)
 from .theme_tokens import ThemeMode, apply_theme, theme_for_mode
 
 # ------------------------------------------------------------------ 断点
@@ -248,6 +252,7 @@ class MainWindow(QMainWindow):
         self._widget_page: dict[QWidget, str] = {}
 
         self._build()
+        self._refresh_header(self._snapshot)
         self.setWindowTitle("AI Relay B V3.0")
         self.resize(1280, 820)  # 规格 13.4 建议初始 1280×820，可缩放
 
@@ -434,8 +439,9 @@ class MainWindow(QMainWindow):
     def _refresh_header(self, snapshot: ApplicationSnapshot) -> None:
         self._recv_badge.set_tone("success" if snapshot.receiving_enabled else "neutral")
         self._recv_badge.set_value("接收 开启" if snapshot.receiving_enabled else "接收 已暂停")
-        self._conn_badge.set_tone("success" if snapshot.connection_healthy else "recovering")
-        self._conn_badge.set_value("连接 正常" if snapshot.connection_healthy else "连接 异常/未知")
+        conn = connection_presentation(snapshot)
+        self._conn_badge.set_tone(conn.tone)
+        self._conn_badge.set_value(connection_short_label(conn.headline))
 
     # ------------------------------------------------------------ 停止入口
 

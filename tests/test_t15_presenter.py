@@ -399,6 +399,106 @@ def test_connection_falls_back_to_legacy_fields():
     assert c_down.headline == "接口未连接"
 
 
+# ------------------------------------------------ T15R：连接语义收紧
+
+
+def test_connection_transport_down_is_recovering_not_danger():
+    """普通网络问题：接口暂不可达，琥珀 recovering，不做最终 danger。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=False, is_stale=False,
+                              last_observed_at=T)
+    c = connection_presentation(_snap(conn_struct=conn))
+    assert c.headline == "接口暂不可达"
+    assert c.tone == "recovering"
+
+
+def test_connection_payload_invalid_is_explicit_danger():
+    """payload_valid=False → 明确异常（danger），不是暂不可达。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=False)
+    c = connection_presentation(_snap(conn_struct=conn))
+    assert "校验未通过" in c.headline
+    assert c.tone == "danger"
+
+
+def test_connection_transport_ok_but_payload_unknown_is_neutral():
+    """transport 可达 ≠ payload 已验证：不能直接声称正常。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=None,
+                              is_stale=False)
+    c = connection_presentation(_snap(conn_struct=conn, conn_healthy=True))
+    assert c.headline == "接口可达，业务状态待核验"
+    assert c.tone == "neutral"
+    assert c.headline != "模型/接口连接正常"
+
+
+def test_connection_success_requires_payload_valid():
+    """只有 transport_ok=True + payload_valid=True 才可声称正常。"""
+    conn = ConnectionSnapshot(source="S1", transport_ok=True, payload_valid=True,
+                              is_stale=False)
+    c = connection_presentation(_snap(conn_struct=conn))
+    assert c.headline == "模型/接口连接正常"
+    assert c.tone == "success"
+
+
+def test_connection_short_label_keeps_stale_not_green():
+    """Header 短文案由 authoritative headline 映射；stale 绝不映射成‘连接 正常’。"""
+    from ui.status_presenter import connection_short_label
+
+    assert connection_short_label("模型/接口连接正常") == "连接 正常"
+    assert connection_short_label("接口未连接") == "连接 异常/未知"
+    assert connection_short_label("连接状态可能已过期") == "连接 可能已过期"
+    assert connection_short_label("接口暂不可达") == "连接 暂不可达"
+
+
+# ------------------------------------------------ T15R：运行时长 / 队列阻塞
+
+
+def test_format_runtime_uses_upstream_seconds():
+    """运行时长只依赖上游 runtime_seconds；UI/展示层不自行计时。"""
+    from ui.status_presenter import format_runtime
+
+    assert format_runtime(3661) == "01:01:01"
+    assert format_runtime(0) == "00:00:00"
+    assert format_runtime(-5) == "00:00:00"
+    assert format_runtime(None) == "未知"
+
+
+def test_normal_watching_chain_all_todo():
+    """普通 WATCHING（无中断/无进展）：7 节点全 todo，且不把冷却标成完成。"""
+    s = _snap(phase="WATCHING")
+    steps = recovery_steps(s)
+    assert len(steps) == 7
+    assert all(step.state == "todo" for step in steps)
+    assert steps[6].state == "todo"   # 冷却
+
+
+def test_recovered_watching_cooldown_still_todo():
+    """已恢复执行：0..5 done；『冷却』(6) 保持 todo。"""
+    s = _snap(phase="WATCHING", interruption_id="i-7", last_real_progress_at=T)
+    steps = recovery_steps(s)
+    assert [st.state for st in steps[:6]] == ["done"] * 6
+    assert steps[6].state == "todo"
+    assert steps[6].label == "冷却"
+
+
+def test_queue_brief_exposes_blocked_reason():
+    """队列摘要不得丢掉具体阻塞原因；未知原因做安全 fallback。"""
+    from app.snapshots import QueueItemSnapshot
+
+    s = _snap().replace_snapshot(
+        waiting_task_count=27,
+        queue_brief=(
+            QueueItemSnapshot(task_id="t0", sequence=12, title="q0", state="BLOCKED",
+                              blocked_reason="SESSION_MISSING"),
+            QueueItemSnapshot(task_id="t1", sequence=13, title="q1", state="BLOCKED",
+                              blocked_reason="UNKNOWN_CODE_X"),
+            QueueItemSnapshot(task_id="t2", sequence=14, title="q2", state="BLOCKED"),
+        ),
+    )
+    rows = queue_brief_rows(s, max_rows=3)
+    assert rows[0] == "seq 12 · q0 · BLOCKED · 原会话记录缺失，需要人工核对"
+    assert "UNKNOWN_CODE_X" in rows[1]      # 未知 reason 回退原始 code
+    assert "原因待核对" in rows[2]           # 无 reason 且 BLOCKED → 待核对
+
+
 def test_next_action_comes_only_from_snapshot():
     """next_action 只来自 next_check_at；缺失不造假时间，终态不显示。"""
     no_next = _snap(phase="WAIT_NETWORK", next_check_at=None)
