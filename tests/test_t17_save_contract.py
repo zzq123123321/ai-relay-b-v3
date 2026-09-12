@@ -87,6 +87,40 @@ class TestSaveMapping:
         exc = SettingsValidationError("xa")
         assert exc.code == "settings_validation"
 
+    def test_first_save_conflict_no_rev_none(self):
+        result = map_settings_save_error(
+            SettingsConflictError("首次保存竞争", expected=None, actual=1),
+            base_revision=None,
+        )
+        assert result.kind is SettingsSaveOutcomeKind.CONFLICT
+        assert result.base_revision is None
+        assert result.actual_revision == 1
+        assert result.new_revision is None
+        assert "rev None" not in result.message
+        assert "尚未保存配置" in result.message
+        assert "仍使用原配置" in result.message
+
+    def test_conflict_actual_none_no_rev_none(self):
+        result = map_settings_save_error(
+            SettingsConflictError("反向异常边界", expected=1, actual=None),
+            base_revision=1,
+        )
+        assert result.kind is SettingsSaveOutcomeKind.CONFLICT
+        assert result.base_revision == 1
+        assert result.actual_revision is None
+        assert result.new_revision is None
+        assert "rev None" not in result.message
+        assert "没有生效配置" in result.message
+        assert "仍使用原配置" in result.message
+
+    def test_conflict_regular_revs_still_full_text(self):
+        result = map_settings_save_error(
+            SettingsConflictError("CAS 冲突", expected=12, actual=13),
+            base_revision=12,
+        )
+        assert "rev 13" in result.message
+        assert "rev 12" in result.message
+
     def test_frozen_save_result(self):
         r = SettingsSaveResult(
             kind=SettingsSaveOutcomeKind.SAVED,
@@ -154,3 +188,15 @@ class TestRevisionPresenter:
     def test_detail_contains_new_settings_take_effect_later(self):
         p = present_settings_revision(self._active("10"), 13)
         assert "新设置只影响之后接收/启动的任务" in p.detail
+
+    def test_large_revision_int_and_str_same(self):
+        p = present_settings_revision(self._active("10000000000"), 10000000000)
+        assert p.differs is False
+        assert p.tone == "success"
+        assert p.detail == "当前活动任务使用相同配置版本"
+
+    def test_large_revision_different_shows_both(self):
+        p = present_settings_revision(self._active("10000000000"), 10000000001)
+        assert p.differs is True
+        assert "rev 10000000001" in p.headline
+        assert "仍使用 rev 10000000000" in p.detail

@@ -205,11 +205,19 @@ def map_settings_save_error(exc: Exception, *, base_revision: int | None) -> Set
             base_revision=base_revision,
         )
     if isinstance(exc, SettingsConflictError):
+        actual_text = (
+            f"rev {exc.actual}" if exc.actual is not None else "没有生效配置"
+        )
+        expected_text = (
+            f"rev {exc.expected}"
+            if exc.expected is not None
+            else "“尚未保存配置”的状态"
+        )
         return SettingsSaveResult(
             kind=SettingsSaveOutcomeKind.CONFLICT,
             message=(
-                "设置已被其他操作更新：数据库当前为 rev "
-                f"{exc.actual}，本页草稿基于 rev {exc.expected}；"
+                "设置已被其他操作更新：数据库当前为 "
+                f"{actual_text}，本页草稿基于 {expected_text}；"
                 "仍使用原配置，请重新载入并核对后保存"
             ),
             base_revision=base_revision,

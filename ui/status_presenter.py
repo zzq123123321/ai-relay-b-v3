@@ -679,9 +679,13 @@ def _normalize_revision(value: object) -> int | None:
         return value if value >= 1 else None
     if isinstance(value, str):
         s = value.strip()
-        if not s.isdecimal() or len(s) > 10:
+        if not s.isdecimal():
             return None
-        return int(s) if int(s) >= 1 else None
+        try:
+            n = int(s)
+        except ValueError:
+            return None
+        return n if n >= 1 else None
     return None
 
 
