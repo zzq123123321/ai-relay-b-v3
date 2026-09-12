@@ -1,0 +1,186 @@
+/* =====================================================================
+ * T13 集中主题样式表（模板）。
+ * @路径@ 占位符由 ui.theme_tokens.render_qss() 替换为 token 值。
+ * 禁止在控件构造函数里散落 setStyleSheet 覆盖本文件。
+ * 按钮正式七态：default / hover / pressed / focus / disabled / loading / error
+ *   loading 由动态属性 busy 表达（虚线环=非纯色通道）；
+ *   error 由动态属性 error 表达（实线危险环 + 底色 + 文本/可访问说明）。
+ * ===================================================================== */
+
+QWidget {
+    font-family: @font.family@;
+    font-size: @font.size.body@px;
+    color: @text.primary@;
+}
+
+QWidget#pageRoot {
+    background-color: @surface.page@;
+}
+
+QToolTip {
+    background-color: @surface.card@;
+    border: 1px solid @border.default@;
+    border-radius: @radius.control@px;
+    color: @text.primary@;
+    padding: @spacing.xs@px;
+}
+
+/* ------------------------------ 按钮 ------------------------------ */
+
+QPushButton {
+    min-height: @size.control.button@px;
+    padding: 0 @spacing.lg@px;
+    border: 1px solid @border.default@;
+    border-radius: @radius.button@px;
+    background-color: @surface.card@;
+    color: @text.primary@;
+    font-weight: @font.weight.medium@;
+    text-align: center;
+}
+QPushButton:hover   { background-color: @surface.inset@; border-color: @border.default@; }
+QPushButton:pressed { background-color: @surface.page@;  border-color: @border.default@; }
+QPushButton:disabled {
+    background-color: @surface.inset@;
+    border-color: @border.subtle@;
+    color: @text.disabled@;
+}
+QPushButton:focus { border: 2px solid @focus.color@; }
+
+/* primary：实心主按钮（浅色白字 / 深色深字，颜色取规格 13.2） */
+QPushButton[variant="primary"] {
+    background-color: @color.action.primary.fill@;
+    border-color: @color.action.primary.fg@;
+    color: @text.on.primary@;
+}
+QPushButton[variant="primary"]:hover   { background-color: @color.action.primary.hover@; }
+QPushButton[variant="primary"]:pressed { background-color: @color.action.primary.pressed@; }
+QPushButton[variant="primary"]:disabled {
+    background-color: @surface.inset@;
+    border-color: @border.subtle@;
+    color: @text.disabled@;
+}
+QPushButton[variant="primary"]:focus { border: 2px solid @focus.color@; }
+
+/* secondary：中性描边 */
+QPushButton[variant="secondary"] {
+    background-color: @surface.card@;
+    border-color: @border.default@;
+    color: @text.primary@;
+}
+QPushButton[variant="secondary"]:hover   { background-color: @color.action.secondary.hover@; }
+QPushButton[variant="secondary"]:pressed { background-color: @color.action.secondary.pressed@; }
+QPushButton[variant="secondary"]:focus   { border: 2px solid @focus.color@; }
+
+/* danger：红描边（危险动作；另有文字/图标/状态共同表达） */
+QPushButton[variant="danger"] {
+    background-color: @surface.card@;
+    border-color: @color.status.danger.fg@;
+    color: @color.status.danger.fg@;
+}
+QPushButton[variant="danger"]:hover   { background-color: @color.status.danger.bg@; }
+QPushButton[variant="danger"]:pressed { background-color: @color.status.danger.bg@; border-color: @focus.color@; }
+QPushButton[variant="danger"]:focus   { border: 2px solid @color.status.danger.fg@; }
+
+/* text：低频文字按钮/更多菜单 */
+QPushButton[variant="text"] {
+    background-color: transparent;
+    border: 1px solid transparent;
+    color: @text.secondary@;
+}
+QPushButton[variant="text"]:hover   { color: @color.action.primary.fg@; }
+QPushButton[variant="text"]:pressed { color: @color.action.primary.pressed@; }
+QPushButton[variant="text"]:focus   { border: 2px solid @focus.color@; color: @color.action.primary.fg@; }
+
+/* loading（busy）：虚线环 + 主色，cursor 提示，区别于 disabled */
+QPushButton[busy="true"] {
+    border-style: dashed;
+    border-color: @color.action.primary.fg@;
+    cursor: progress;
+}
+QPushButton[variant="primary"][busy="true"] {
+    background-color: @color.action.primary.surface@;
+    color: @color.action.primary.fg@;
+}
+QPushButton[variant="danger"][busy="true"] {
+    border-color: @color.status.danger.fg@;
+    color: @color.status.danger.fg@;
+}
+
+/* error：实线危险环（非仅颜色，配合 error 文案/可访问说明） */
+QPushButton[error="true"] {
+    border: 2px solid @border.danger@;
+    background-color: @color.status.danger.bg@;
+    color: @color.status.danger.fg@;
+}
+
+/* ------------------------------ 标签 ------------------------------ */
+
+QLabel { background: transparent; }
+QLabel[heading="true"] {
+    font-size: @font.size.block@px;
+    font-weight: @font.weight.semibold@;
+    color: @text.primary@;
+}
+QLabel[mono="true"] { font-family: @font.mono@; }
+
+/* 状态徽标：文字+符号+颜色共同表达（UI-A14 可访问性），不止颜色 */
+QLabel[tone="success"] {
+    color: @color.status.success.fg@;
+    background-color: @color.status.success.bg@;
+    border-radius: @radius.control@px;
+    padding: @spacing.xxs@px @spacing.sm@px;
+    font-weight: @font.weight.semibold@;
+}
+QLabel[tone="recovering"] {
+    color: @color.status.recovering.fg@;
+    background-color: @color.status.recovering.bg@;
+    border-radius: @radius.control@px;
+    padding: @spacing.xxs@px @spacing.sm@px;
+    font-weight: @font.weight.semibold@;
+}
+QLabel[tone="danger"] {
+    color: @color.status.danger.fg@;
+    background-color: @color.status.danger.bg@;
+    border-radius: @radius.control@px;
+    padding: @spacing.xxs@px @spacing.sm@px;
+    font-weight: @font.weight.semibold@;
+}
+QLabel[tone="neutral"] {
+    color: @color.status.neutral.fg@;
+    background-color: @color.status.neutral.bg@;
+    border-radius: @radius.control@px;
+    padding: @spacing.xxs@px @spacing.sm@px;
+    font-weight: @font.weight.semibold@;
+}
+
+/* ------------------------------ 输入框 ------------------------------ */
+
+QLineEdit {
+    min-height: @size.control.button@px;
+    padding: 0 @spacing.sm@px;
+    border: 1px solid @border.default@;
+    border-radius: @radius.control@px;
+    background-color: @surface.card@;
+    color: @text.primary@;
+    selection-background-color: @color.selection.bg@;
+    selection-color: @color.selection.fg@;
+}
+QLineEdit:hover   { border-color: @border.default@; }
+QLineEdit:focus   { border: 2px solid @focus.color@; }
+QLineEdit:disabled {
+    background-color: @surface.inset@;
+    border-color: @border.subtle@;
+    color: @text.disabled@;
+}
+QLineEdit[input-error="true"] {
+    border: 2px solid @border.danger@;
+    color: @color.status.danger.fg@;
+}
+
+/* ------------------------------ 卡片容器 ------------------------------ */
+
+QFrame[card="true"] {
+    background-color: @surface.card@;
+    border: 1px solid @border.subtle@;
+    border-radius: @radius.card@px;
+}

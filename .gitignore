@@ -9,3 +9,4 @@ data/
 logs/
 .ruff_cache/
 evidence/
+artifacts/
