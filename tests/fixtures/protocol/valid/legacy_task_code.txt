@@ -1,0 +1,15 @@
+----- AI_RELAY_BEGIN -----
+SOURCE: CHATGPT
+TARGET: REASONIX
+TYPE: TASK
+TASK_ID: task-legacy-001
+ROUND: 0
+MAX_ROUNDS: 3
+CONTENT:
+请分析并修复代码。
+def 你好():
+    value = "中文"
+
+    if value:
+        return value
+----- AI_RELAY_END -----

@@ -1,0 +1,14 @@
+AI_RELAY/1
+MESSAGE_ID: task-chinese-001
+SOURCE: CHATGPT
+TARGET: OPENCHAMBER
+TYPE: TASK
+ROUND: 0
+MAX_ROUNDS: 3
+
+请检查当前项目的任务列表显示问题。
+def 你好():
+    value = "中文"
+
+    if value:
+        return value
