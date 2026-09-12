@@ -132,6 +132,15 @@ def _corrupt_ingress(db, task_key: str) -> None:
     )
 
 
+def _replace_project_key_value(db, task_key: str, value: object) -> None:
+    import json as _json
+
+    db.connection.execute(
+        "UPDATE tasks SET ingress_snapshot_json=? WHERE task_key=?",
+        (_json.dumps({"project_key": value}, ensure_ascii=False), task_key),
+    )
+
+
 def _exec_json(session_id: str | None, started_at: str) -> str:
     import json
 
@@ -445,6 +454,17 @@ class TestCorruptData:
         assert detail.raw_message != ""
         assert any("无法解析" in reason for reason in detail.corrupt_reasons)
 
+    def test_non_string_project_key_not_matched_by_search(self, db, store, queries):
+        a, b, c = _build_alpha_env(db, store)
+        _replace_project_key_value(db, b.task_key, {"name": "proj-alpha"})
+        page = queries.list_tasks(search_text="proj-alpha")
+        assert {row.task_key for row in page.items} == {a.task_key}
+        by_id = queries.list_tasks(search_text="task-B")
+        assert [row.task_key for row in by_id.items] == [b.task_key]
+        detail = queries.get_task_detail(b.task_key)
+        assert detail.project_key is None
+        assert any("非字符串" in r for r in detail.corrupt_reasons)
+
 
 class TestTaskDetail:
     def test_detail_raw_message_and_body_complete(self, db, store, queries):
@@ -482,6 +502,24 @@ class TestTaskDetail:
         assert a3.resolved_session_id is None
         assert any("无法解析为 JSON" in r for r in a3.corrupt_reasons)
 
+    def test_valid_non_object_execution_snapshot_degrades(self, db, store, queries):
+        a, b, c = _build_alpha_env(db, store)
+        db.connection.execute(
+            "UPDATE attempts SET execution_snapshot_json=? WHERE attempt_id='a1'",
+            ("[]",),
+        )
+        db.connection.execute(
+            "UPDATE attempts SET execution_snapshot_json=? WHERE attempt_id='a2'",
+            ('"abc"',),
+        )
+        attempts = queries.get_task_detail(a.task_key).attempts
+        a1 = next(x for x in attempts if x.attempt_id == "a1")
+        a2 = next(x for x in attempts if x.attempt_id == "a2")
+        assert a1.resolved_session_id is None
+        assert a2.resolved_session_id is None
+        assert all(any("不是 JSON 对象" in r for r in x.corrupt_reasons)
+                   for x in (a1, a2))
+
     def test_list_task_attempts_public_contract(self, db, store, queries):
         a, b, c = _build_alpha_env(db, store)
         attempts = queries.list_task_attempts(a.task_key)
@@ -513,6 +551,22 @@ class TestResultVersions:
 
     def test_versions_missing_task_returns_empty(self, db, store, queries):
         assert queries.list_task_result_versions("no-such-task") == ()
+
+    def test_result_version_reports_sha_corruption(self, db, store, queries):
+        env, misc = _build_alpha_env(db, store), _build_misc_env(db, store)
+        s_task_key = misc[2].task_key
+        db.connection.execute(
+            "INSERT INTO results (result_id, task_key, attempt_id, revision, state,"
+            " source, final_body, protocol_text, sha256, remote_message_ids_json,"
+            " committed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("res-s-2", s_task_key, "s1", 2, "FAILED", "MANUAL_WRAP",
+             "坏sha正文", "坏sha正文", "zz-not-a-sha", "[]", _T0),
+        )
+        versions = queries.list_task_result_versions(s_task_key)
+        assert [v.revision for v in versions] == [2, 1]
+        assert any("sha256 损坏" in r for r in versions[0].corrupt_reasons)
+        detail = queries.get_result("res-s-2")
+        assert any("sha256 损坏" in r for r in detail.corrupt_reasons)
 
 
 class TestExactResultId:

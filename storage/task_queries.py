@@ -313,6 +313,9 @@ class TaskQueries:
             result_id, task_key_, attempt_id, revision, state, source, sha256, (
                 committed_at
             ), remote_ids_json, delivery_state_col = tuple(row)
+            issues = list(self._remote_ids_issues(remote_ids_json))
+            if not _SHA256_HEX.match(sha256):
+                issues.append(f"sha256 损坏：{sha256!r}")
             versions.append(
                 ResultVersionRow(
                     result_id=result_id, task_key=task_key_, attempt_id=attempt_id,
@@ -320,7 +323,7 @@ class TaskQueries:
                     committed_at=committed_at,
                     authoritative=(int(revision) == current_rev),
                     delivery_state=delivery_state_col,
-                    corrupt_reasons=self._remote_ids_issues(remote_ids_json),
+                    corrupt_reasons=tuple(issues),
                 )
             )
         return tuple(versions)
@@ -360,13 +363,16 @@ class TaskQueries:
     # ---------------------------------------------------------------- internals
 
     def _probe_json1(self) -> None:
-        """构造时验证 SQLite 提供 json_valid/json_extract；不修改任何 schema。"""
+        """构造时验证 SQLite 提供 json_valid/json_extract/json_type；不修改任何 schema。"""
         try:
-            self._db.connection.execute("SELECT json_valid('{}')").fetchone()
+            self._db.connection.execute(
+                "SELECT json_valid('{}'), json_type('{}', '$'),"
+                " json_extract('{}', '$')"
+            ).fetchone()
         except sqlite3.Error as exc:
             raise TaskQueryError(
-                "当前 SQLite 缺 JSON1 扩展（json_valid/json_extract），无法安全搜索"
-                " project_key；禁止为此修改 schema，需升级运行时"
+                "当前 SQLite 缺 JSON1 扩展（json_valid/json_extract/json_type），无法"
+                " 安全搜索 project_key；禁止为此修改 schema，需升级运行时"
             ) from exc
 
     def _checked_limit(self, limit: int) -> int:
@@ -399,12 +405,17 @@ class TaskQueries:
         if search_text is not None and search_text != "":
             conds = [
                 "instr(t.task_id, ?) > 0",
-                "CASE WHEN json_valid(t.ingress_snapshot_json)=1 THEN"
+                "CASE WHEN json_valid(t.ingress_snapshot_json)=1"
+                " AND json_type(t.ingress_snapshot_json, ?)='text' THEN"
                 " instr(json_extract(t.ingress_snapshot_json, ?), ?) > 0 ELSE 0 END",
                 "EXISTS (SELECT 1 FROM results rr"
                 " WHERE rr.task_key=t.task_key AND instr(rr.result_id, ?) > 0)",
             ]
-            params += [search_text, _PROJECT_KEY_PATH, search_text, search_text]
+            # 顺序与 conds 一一对应：task_id 文本、project_key 路径/路径/文本、result_id 文本
+            params += [
+                search_text, _PROJECT_KEY_PATH, _PROJECT_KEY_PATH, search_text,
+                search_text,
+            ]
             where.append("(" + " OR ".join(conds) + ")")
         return " AND ".join(where), params
 
@@ -507,6 +518,8 @@ def _parse_resolved_session(raw: str) -> tuple[str | None, tuple[str, ...]]:
     data, ok = _safe_load_object(raw)
     if not ok:
         return None, ("execution_snapshot_json 无法解析为 JSON",)
+    if not isinstance(data, dict):
+        return None, ("execution_snapshot_json 不是 JSON 对象",)
     value = data.get("resolved_session_id")
     if value is None:
         return None, ()
