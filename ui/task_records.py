@@ -178,8 +178,20 @@ class TaskRecordsPage(QWidget):
 
     # ------------------------------------------------------------- Provider seam
 
-    def _with_error(self, exc: Exception, kind: str, args: tuple) -> None:
-        self._last_failed = (kind, args)
+    def _with_error(
+        self,
+        exc: Exception,
+        kind: str,
+        *,
+        cursor: int | None = None,
+        text: str | None = None,
+        states: tuple[str, ...] | None = None,
+        task_key: str | None = None,
+        result_id: str | None = None,
+        action: str = "",
+    ) -> None:
+        """冻结最近一次失败查询的原始参数，供重试时重播同 query。"""
+        self._last_failed = (kind, cursor, text, states, task_key, result_id, action)
         self._error_label.setText(f"查询失败：{type(exc).__name__}: {exc}")
         self._error_bar.show()
 
@@ -188,39 +200,51 @@ class TaskRecordsPage(QWidget):
         self._last_failed = None
 
     def retry_query(self) -> None:
-        """重播最近一次相同的只读查询；仅是查询重试，不是任务重跑。"""
+        """重播最近一次相同的只读查询（冻结 cursor/search/filter 等原参数，
+        不是任务重跑、不重读控件当前值）。"""
         if self._last_failed is None:
             return
-        kind, args = self._last_failed
+        kind, cursor, text, states, task_key, result_id, action = self._last_failed
         if kind == "list":
-            self._run_list(*args)
+            page = self._fetch_page(cursor, text, states, action)
+            if page is None:
+                return
+            if action == "list_fresh":
+                self._commit_fresh(page)
+            elif action == "list_next":
+                self.cursor_history.append(self.current_cursor)
+                self.current_cursor = cursor
+                self._render_page(page)
+            else:  # list_prev
+                self.cursor_history.pop()
+                self.current_cursor = cursor
+                self._render_page(page)
         elif kind == "detail":
-            self.load_task_detail(args[0])
-        elif kind == "versions":
-            self._run_versions(args[0])
+            self.load_task_detail(task_key)
         elif kind == "result":
-            self.select_result(args[0])
+            self.select_result(result_id)
 
     # ------------------------------------------------------------- 列表与分页
 
     def _filters(self) -> tuple[str | None, tuple[str, ...] | None]:
         text = self.search_input.text().strip()
-        self.search_text = text
         state = None
         for label, value in STATE_FILTER_LABELS:
             if label == self.filter_combo.currentText():
                 state = value
                 break
-        self.state_filter = state
         return (text or None), ((state,) if state else None)
 
     def _load_list(self) -> None:
-        self.current_cursor = None
-        self.cursor_history.clear()
-        self._run_list(None)
-
-    def _run_list(self, cursor: int | None) -> None:
         text, states = self._filters()
+        page = self._fetch_page(None, text, states, "list_fresh")
+        if page is None:
+            return
+        self._commit_fresh(page)
+
+    def _fetch_page(self, cursor: int | None, text: str | None,
+                    states: tuple[str, ...] | None, action: str):
+        """查询目标页；失败返回 None 并冻结失败参数，成功才 commit search/filter。"""
         try:
             page = self._provider.list_tasks(
                 limit=_PAGE_SIZE,
@@ -229,9 +253,25 @@ class TaskRecordsPage(QWidget):
                 state_filter=states,
             )
         except Exception as exc:  # noqa: BLE001 页内错误条保留旧数据，不吞错
-            self._with_error(exc, "list", (cursor,))
-            return
+            self._with_error(
+                exc, "list", cursor=cursor, text=text, states=states, action=action
+            )
+            return None
         self._clear_error()
+        self.search_text = text or ""
+        self.state_filter = states[0] if states else None
+        return page
+
+    def _commit_fresh(self, page) -> None:
+        """成功的新查询（搜索/过滤/首查）一次性提交重置分页与历史选择。"""
+        self.selected_task_key = None
+        self.selected_result_id = None
+        self.detail_panel.clear()
+        self.current_cursor = None
+        self.cursor_history.clear()
+        self._render_page(page)
+
+    def _render_page(self, page) -> None:
         self._has_more = bool(page.has_more)
         self._next_cursor = page.next_cursor
         self._render_table(page.items)
@@ -267,15 +307,26 @@ class TaskRecordsPage(QWidget):
     def next_page(self) -> None:
         if not self._has_more:
             return
+        target = self._next_cursor
+        text, states = self._filters()
+        page = self._fetch_page(target, text, states, "list_next")
+        if page is None:
+            return
         self.cursor_history.append(self.current_cursor)
-        self.current_cursor = self._next_cursor
-        self._run_list(self.current_cursor)
+        self.current_cursor = target
+        self._render_page(page)
 
     def previous_page(self) -> None:
         if not self.cursor_history:
             return
-        self.current_cursor = self.cursor_history.pop()
-        self._run_list(self.current_cursor)
+        target = self.cursor_history[-1]
+        text, states = self._filters()
+        page = self._fetch_page(target, text, states, "list_prev")
+        if page is None:
+            return
+        self.cursor_history.pop()
+        self.current_cursor = target
+        self._render_page(page)
 
     def _on_search_changed(self, text: str) -> None:
         del text
@@ -286,13 +337,13 @@ class TaskRecordsPage(QWidget):
         self._reset_filters()
 
     def _reset_filters(self) -> None:
-        """显式用户搜索/过滤变化：重置分页与历史选择，重查首页。"""
-        self.selected_task_key = None
-        self.selected_result_id = None
-        self.detail_panel.clear()
-        self.current_cursor = None
-        self.cursor_history.clear()
-        self._run_list(None)
+        """显式用户搜索/过滤变化：新查询成功才重置分页并清除历史选择；
+        失败则保持旧表、旧 viewed 选择、旧分页状态，只显示错误条。"""
+        text, states = self._filters()
+        page = self._fetch_page(None, text, states, "list_fresh")
+        if page is None:
+            return
+        self._commit_fresh(page)
 
     def _on_row_clicked(self, row: int, col: int) -> None:
         del col
@@ -306,38 +357,41 @@ class TaskRecordsPage(QWidget):
     # ------------------------------------------------------------- 详情与 Result
 
     def load_task_detail(self, task_key: str) -> None:
-        self.selected_task_key = task_key
-        self.selected_result_id = None
+        """详情 bundle（detail + versions）全部成功才一次性切换；
+        任一查询失败 → 保持旧 bundle（旧选择/旧详情/旧版本/旧 Result），只显错误条。"""
         try:
             detail = self._provider.get_task_detail(task_key)
-        except Exception as exc:  # noqa: BLE001 页内错误条，保留旧详情
-            self._with_error(exc, "detail", (task_key,))
+        except Exception as exc:  # noqa: BLE001 页内错误条，保留旧详情与旧选择
+            self._with_error(exc, "detail", task_key=task_key)
             return
         if detail is None:
+            self.selected_task_key = task_key
+            self.selected_result_id = None
             self.detail_panel.render_detail(None)
+            self._clear_error()
             return
-        self.detail_panel.render_detail(detail)
-        self._run_versions(task_key)
-
-    def _run_versions(self, task_key: str) -> None:
         try:
             versions = self._provider.list_task_result_versions(task_key)
-        except Exception as exc:  # noqa: BLE001
-            self._with_error(exc, "versions", (task_key,))
+        except Exception as exc:  # noqa: BLE001 版本失败 → 不切换到新任务，避免跨任务污染
+            self._with_error(exc, "detail", task_key=task_key)
             return
-        self._clear_error()
+        self.selected_task_key = task_key
+        self.selected_result_id = None
+        self.detail_panel.render_detail(detail)
         self.detail_panel.render_versions(versions)
         self.detail_panel.reset_result_section()
+        self._clear_error()
 
     def select_result(self, result_id: str) -> None:
-        """exact result 精确读取；缺失 → 保持 selected_result_id，UI 显示无法读取。"""
-        self.selected_result_id = result_id
+        """exact result 精确读取；query 成功（含 None 缺失）才 commit 选择，
+        失败保持旧 selected_result_id / 旧 Result 内容 / 旧 copy target。"""
         try:
             detail = self._provider.get_result(result_id)
         except Exception as exc:  # noqa: BLE001
-            self._with_error(exc, "result", (result_id,))
+            self._with_error(exc, "result", result_id=result_id)
             return
         self._clear_error()
+        self.selected_result_id = result_id
         if detail is None:
             self.detail_panel.render_result_missing(result_id)
         else:

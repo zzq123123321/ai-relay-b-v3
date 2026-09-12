@@ -143,6 +143,9 @@ class FakeTaskHistoryProvider:
     def __init__(self, *, empty: bool = False) -> None:
         self.empty = empty
         self.fail = False
+        self.fail_detail = False
+        self.fail_versions = False
+        self.fail_result = False
         self.calls: list[tuple] = []
         self.list_calls: list[dict] = []
         self.detail_calls: list[str] = []
@@ -220,7 +223,7 @@ class FakeTaskHistoryProvider:
     def get_task_detail(self, task_key: str) -> TaskDetail | None:
         self.calls.append(("get_task_detail", task_key))
         self.detail_calls.append(task_key)
-        if self.fail:
+        if self.fail or self.fail_detail:
             raise RuntimeError("simulated query failure")
         if task_key == "CHATGPT:task-missing":
             return None
@@ -284,21 +287,31 @@ class FakeTaskHistoryProvider:
             VersionRow(result_id="res-a-1", task_key=task_key, attempt_id="a1",
                        revision=1, state="COMPLETED", source="AUTO_RELAY",
                        sha256=_SHA, committed_at="2026-10-01T08:06:30+00:00",
-                       authoritative=False, delivery_state="OFFERED"),
+                       authoritative=False, delivery_state="OFFERED",
+                       corrupt_reasons=("结果正文解码失败",)),
         )
 
     def list_task_result_versions(self, task_key: str) -> tuple:
         self.calls.append(("list_task_result_versions", task_key))
         self.version_calls.append(task_key)
-        if self.fail:
+        if self.fail or self.fail_versions:
             raise RuntimeError("simulated query failure")
         return self.versions_for(task_key)
 
     def get_result(self, result_id: str) -> ResultDetail | None:
         self.calls.append(("get_result", result_id))
         self.result_calls.append(result_id)
-        if self.fail:
+        if self.fail or self.fail_result:
             raise RuntimeError("simulated query failure")
+        if result_id == LONG_RESULT:
+            return ResultDetail(
+                result_id=result_id, task_key="CHATGPT:task-A", attempt_id="a2",
+                revision=9, state="COMPLETED", source="MANUAL_WRAP",
+                final_body="长 result_id 完整值复制验证", protocol_text="AI_RELAY/1\n\n长ID",
+                sha256=_SHA, remote_message_ids=("m-long",),
+                committed_at="2026-10-01T09:00:00+00:00", authoritative=False,
+                delivery_state="ACKED",
+            )
         if result_id == "res-a-2":
             return ResultDetail(
                 result_id=result_id, task_key="CHATGPT:task-A", attempt_id="a2",
@@ -676,3 +689,164 @@ def panel_block_texts(panel: TaskDetailPanel, attempt_id: str) -> str:
         if label.text() and f"attempt_id：{attempt_id}" in label.text():
             return label.text()
     raise AssertionError(f"找不到 attempt_id={attempt_id} 的展示块")
+
+
+class TestB2RAtomicity:
+    """B2R：query 失败时页面状态只在新 query 成功后 commit。
+    验收 1-11：旧选择/旧详情/旧版本/旧 Result/旧 copy target/游标均保持。"""
+
+    def test_01_detail_failure_keeps_old_viewed_and_result(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        page.select_result("res-a-2")
+        provider.fail_detail = True
+        page.load_task_detail("CHATGPT:task-B")
+        assert page.selected_task_key == "CHATGPT:task-A"
+        assert page.selected_result_id == "res-a-2"
+        assert page.detail_panel.task_id_value.text() == "task-A"
+        assert page.detail_panel.version_table.item(0, 1).text() == "res-a-3"
+        assert page.detail_panel.result_readable is True
+        assert page.detail_panel.copy_reply_button.isEnabled() is True
+        assert "res-a-2" in page.detail_panel._result_title.text()
+        assert not page._error_bar.isHidden()
+        assert provider.detail_calls[-1] == "CHATGPT:task-B"
+        assert "task-B" not in page.detail_panel.task_id_value.text()
+
+    def test_02_versions_failure_keeps_old_bundle(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        provider.fail_versions = True
+        page.load_task_detail("CHATGPT:task-B")
+        assert page.selected_task_key == "CHATGPT:task-A"
+        assert page.detail_panel.task_id_value.text() == "task-A"
+        assert page.detail_panel.version_table.rowCount() == 3
+        assert page.detail_panel.version_table.item(0, 1).text() == "res-a-3"
+        assert page.detail_panel.version_table.item(1, 1).text() == "res-a-2"
+        assert page.detail_panel.selected_result_id is None
+        assert not page._error_bar.isHidden()
+
+    def test_03_retry_bundle_switches_after_success(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        provider.fail_versions = True
+        page.load_task_detail("CHATGPT:task-B")
+        assert page.selected_task_key == "CHATGPT:task-A"
+        provider.fail_versions = False
+        page.retry_button.click()
+        assert page.selected_task_key == "CHATGPT:task-B"
+        assert page.detail_panel.task_id_value.text() == "task-B"
+        assert page.detail_panel.version_table.rowCount() == 0
+        assert page.detail_panel.version_note.text() == "无 Result 版本"
+        assert page.detail_panel.selected_result_id is None
+        assert page.detail_panel.copy_result_id_button.isEnabled() is False
+        assert page._error_bar.isHidden()
+
+    def test_04_result_failure_keeps_old_copy_target(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        page.select_result("res-a-2")
+        provider.fail_result = True
+        page.select_result("res-a-3")
+        assert page.selected_result_id == "res-a-2"
+        assert page.detail_panel.selected_result_id == "res-a-2"
+        assert page.detail_panel.result_readable is True
+        assert page.detail_panel.copy_reply_button.isEnabled() is True
+        assert page.detail_panel.copy_sha_button.isEnabled() is True
+        assert "res-a-2" in page.detail_panel._result_title.text()
+        assert page.detail_panel._result_body.text() == "乙失败：精确读取的这一版"
+        assert not page._error_bar.isHidden()
+        assert provider.result_calls[-1] == "res-a-3"
+
+    def test_05_next_page_failure_keeps_cursor(self, qapp, provider):
+        page = _make_page(provider)
+        assert page._next_cursor == 13
+        provider.fail = True
+        page.next_button.click()
+        assert page.current_cursor is None
+        assert page.cursor_history == []
+        assert page.tasks_table.rowCount() == 20
+        assert page.tasks_table.item(19, 0).text() == "task-17"
+        assert not page._error_bar.isHidden()
+
+    def test_06_previous_page_failure_keeps_cursor(self, qapp, provider):
+        page = _make_page(provider)
+        page.next_button.click()
+        assert page.current_cursor == 13
+        assert page.cursor_history == [None]
+        provider.fail = True
+        page.prev_button.click()
+        assert page.current_cursor == 13
+        assert page.cursor_history == [None]
+        assert page.tasks_table.rowCount() == 5
+        assert page.tasks_table.item(0, 0).text() == "task-18"
+        assert not page._error_bar.isHidden()
+
+    def test_07_search_failure_keeps_old_selection(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        provider.fail = True
+        page.search_input.setText("task-01")
+        assert page.selected_task_key == "CHATGPT:task-A"
+        assert page.selected_result_id is None
+        assert page.detail_panel.task_id_value.text() == "task-A"
+        assert page.current_cursor is None
+        assert page.cursor_history == []
+        assert not page._error_bar.isHidden()
+        assert page.tasks_table.rowCount() == 20
+        assert page.tasks_table.item(0, 0).text() == LONG_ID
+
+    def test_08_filter_failure_keeps_old_selection(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        provider.fail = True
+        page.filter_combo.setCurrentText("COMPLETED")
+        assert page.selected_task_key == "CHATGPT:task-A"
+        assert page.detail_panel.task_id_value.text() == "task-A"
+        assert not page._error_bar.isHidden()
+        assert page.tasks_table.rowCount() == 20
+
+    def test_09_retry_list_frozen_params(self, qapp, provider):
+        page = _make_page(provider)
+        page.search_input.setText("task-0")
+        provider.fail = True
+        page.filter_combo.setCurrentText("COMPLETED")
+        failed = provider.list_calls[-1]
+        assert failed["search_text"] == "task-0"
+        assert failed["state_filter"] == ("COMPLETED",)
+        provider.fail = False
+        page.retry_button.click()
+        retried = provider.list_calls[-1]
+        assert retried == failed
+        assert page._error_bar.isHidden()
+
+    def test_10_corrupt_version_visible_with_reasons(self, qapp, provider):
+        page = _make_page(provider)
+        page.load_task_detail("CHATGPT:task-A")
+        table = page.detail_panel.version_table
+        row = None
+        for r in range(table.rowCount()):
+            if table.item(r, 1).text() == "res-a-1":
+                row = r
+                break
+        assert row is not None
+        assert table.item(row, 7).text() == "数据不完整"
+        assert "结果正文解码失败" in table.item(row, 7).toolTip()
+        assert table.item(row, 6).text() == "历史版本"
+
+    def test_11_long_result_id_copy_full_and_missing_id_copyable(self, qapp, provider):
+        page = _make_page(provider)
+        emitted: list[tuple] = []
+        page.copy_value_requested.connect(lambda kind, value: emitted.append((kind, value)))
+        page.load_task_detail("CHATGPT:task-A")
+        panel = page.detail_panel
+        assert panel.copy_result_id_button.isEnabled() is False
+        page.select_result(LONG_RESULT)
+        assert panel.copy_result_id_button.isEnabled() is True
+        panel.copy_result_id_button.click()
+        assert emitted == [("result_id", LONG_RESULT)]
+        emitted.clear()
+        page.select_result("res-missing")
+        assert panel.copy_reply_button.isEnabled() is False
+        assert panel.copy_result_id_button.isEnabled() is True
+        panel.copy_result_id_button.click()
+        assert emitted == [("result_id", "res-missing")]

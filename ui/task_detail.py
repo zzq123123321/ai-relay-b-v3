@@ -191,9 +191,9 @@ class TaskDetailPanel(QWidget):
 
         # ------------------------------------------------------------- Result 版本
         self.version_card = Card("Result 版本")
-        self.version_table = QTableWidget(0, 7)
+        self.version_table = QTableWidget(0, 8)
         self.version_table.setHorizontalHeaderLabels(
-            ("修订", "Result ID", "状态", "来源", "交付", "提交时间", "标记")
+            ("修订", "Result ID", "状态", "来源", "交付", "提交时间", "标记", "损坏")
         )
         self.version_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.version_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -202,6 +202,7 @@ class TaskDetailPanel(QWidget):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self.version_table.setSortingEnabled(False)
         self.version_table.itemSelectionChanged.connect(self._on_version_selected)
         self.version_note = QLabel()
@@ -216,6 +217,9 @@ class TaskDetailPanel(QWidget):
         self._result_title = QLabel("未选择 Result 版本")
         self._result_title.setWordWrap(True)
         self._result_title.setAccessibleName("Result 精确查看标题")
+        self.copy_result_id_button = TextButton("复制 Result ID")
+        self.copy_result_id_button.setAccessibleName("复制 Result ID")
+        self.copy_result_id_button.clicked.connect(self._copy_result_id)
         self._result_body = _block_label("")
         self._result_body.setAccessibleName("Result 最终正文")
         self._result_protocol = QLabel()
@@ -240,7 +244,7 @@ class TaskDetailPanel(QWidget):
         self.copy_reply_button.setAccessibleName("复制回复")
         self.copy_reply_button.clicked.connect(self._on_copy_reply)
 
-        self.result_card.add(self._result_title)
+        self.result_card.add(self.result_head_row())
         self.result_card.add(self._result_missing)
         self.result_card.add(self._result_body)
         sha_row = QHBoxLayout()
@@ -256,6 +260,19 @@ class TaskDetailPanel(QWidget):
         self.clear()
 
     # ------------------------------------------------------------- 内部工具
+
+    def result_head_row(self) -> QWidget:
+        host = QWidget()
+        lay = QHBoxLayout(host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._result_title, 1)
+        lay.addWidget(self.copy_result_id_button)
+        return host
+
+    def _copy_result_id(self) -> None:
+        if not self._selected_result_id:
+            return
+        self.copy_value_requested.emit("result_id", self._selected_result_id)
 
     def _identity_entry(self, row: int, title: str, kind: str) -> tuple[QLabel, TextButton]:
         host, value, copy = _copy_row(kind, title, "")
@@ -322,6 +339,8 @@ class TaskDetailPanel(QWidget):
         self._apply_raw_visibility()
         self._clear_attempts()
         self.version_table.setRowCount(0)
+        self.version_note.setText("无 Result 版本")
+        self.version_note.hide()
         self._result_title.setText("未选择 Result 版本")
         self._result_body.setText("")
         self._result_protocol.setText("")
@@ -330,6 +349,7 @@ class TaskDetailPanel(QWidget):
         self._result_missing.hide()
         self.copy_reply_button.setEnabled(False)
         self.copy_sha_button.setEnabled(False)
+        self.copy_result_id_button.setEnabled(False)
 
     def _clear_attempts(self) -> None:
         while self._attempt_box.count():
@@ -420,6 +440,7 @@ class TaskDetailPanel(QWidget):
         self.version_table.setRowCount(len(rows))
         self.version_note.hide()
         for row, version in enumerate(rows):
+            reasons = tuple(version.corrupt_reasons)
             items = (
                 str(version.revision),
                 version.result_id,
@@ -428,10 +449,14 @@ class TaskDetailPanel(QWidget):
                 version.delivery_state or "—",
                 version.committed_at or "—",
                 "当前权威" if version.authoritative else "历史版本",
+                "数据不完整" if reasons else "",
             )
             for col, text in enumerate(items):
                 cell = QTableWidgetItem(text)
-                cell.setToolTip(text)
+                if col == 7 and reasons:
+                    cell.setToolTip("数据不完整：" + "；".join(reasons))
+                else:
+                    cell.setToolTip(text)
                 cell.setData(Qt.UserRole, version.result_id)
                 self.version_table.setItem(row, col, cell)
         if not rows:
@@ -476,6 +501,7 @@ class TaskDetailPanel(QWidget):
             self._result_missing.show()
         self.copy_reply_button.setEnabled(True)
         self.copy_sha_button.setEnabled(True)
+        self.copy_result_id_button.setEnabled(True)
 
     def _sha_forward(self) -> None:
         value = self._result_sha.text()
@@ -495,6 +521,7 @@ class TaskDetailPanel(QWidget):
         self._result_missing.show()
         self.copy_reply_button.setEnabled(False)
         self.copy_sha_button.setEnabled(False)
+        self.copy_result_id_button.setEnabled(True)
 
     def reset_result_section(self) -> None:
         """切任务时清空精确查看区（不触碰 identity/attempt/versions）。"""
@@ -508,6 +535,7 @@ class TaskDetailPanel(QWidget):
         self._result_missing.hide()
         self.copy_reply_button.setEnabled(False)
         self.copy_sha_button.setEnabled(False)
+        self.copy_result_id_button.setEnabled(False)
 
     def _on_copy_reply(self) -> None:
         if self._result_readable and self._selected_result_id:
