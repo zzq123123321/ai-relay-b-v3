@@ -47,7 +47,9 @@ from .components import (
     TextButton,
     TextInput,
 )
+from .dashboard import Dashboard
 from .navigation import NavigationBar, PAGES, PAGE_IDS
+from .status_presenter import is_superseded_update
 from .theme_tokens import ThemeMode, apply_theme, theme_for_mode
 
 # ------------------------------------------------------------------ 断点
@@ -63,15 +65,6 @@ TIER_NARROW = "narrow"
 
 _TIER_NAMES = (TIER_WIDE, TIER_MEDIUM, TIER_NARROW)
 
-_STATE_TONE = {
-    "ACTIVE": "success",
-    "QUEUED": "neutral",
-    "BLOCKED": "recovering",
-    "COMPLETED": "success",
-    "FAILED": "danger",
-    "STOPPED_BY_USER": "neutral",
-}
-
 
 def tier_for_width(width: int) -> str:
     """按规格 13.4 断点把窗口/内容宽度解析为三档。"""
@@ -83,127 +76,6 @@ def tier_for_width(width: int) -> str:
 
 
 # ================================================================ Fake 页面
-
-
-class _WorkbenchPage(QWidget):
-    """PAGE01 工作台（Fake）。分区清楚：主任务 / 接收 / 自动续接 / 连接。"""
-
-    def __init__(self, snapshot: ApplicationSnapshot) -> None:
-        super().__init__()
-        self._single = False
-        self._rail_in_row = True
-        self._outer = QVBoxLayout(self)
-        self._outer.setContentsMargins(24, 20, 24, 24)
-        self._outer.setSpacing(16)
-
-        heading = QLabel("工作台")
-        heading.setProperty("heading", "true")
-        self._outer.addWidget(heading)
-
-        self._grid_row = QWidget()
-        grid = QHBoxLayout(self._grid_row)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(16)
-
-        self._main = QWidget()
-        main_lay = QVBoxLayout(self._main)
-        main_lay.setContentsMargins(0, 0, 0, 0)
-        main_lay.setSpacing(12)
-
-        self.task_card = Card("主任务（Fake Snapshot）")
-        self._task_title = QLabel()
-        self._task_title.setWordWrap(True)
-        self._task_id = QLabel()
-        self._task_id.setProperty("mono", "true")
-        self._task_meta = QLabel()
-        self._task_meta.setWordWrap(True)
-        self._state_badge = StatusBadge("ACTIVE", tone="success")
-        self.task_card.add(self._state_badge)
-        self.task_card.add(self._task_title)
-        self.task_card.add(self._task_id)
-        self.task_card.add(self._task_meta)
-        self._empty_label = QLabel("暂无活动任务，等待 A 端下发。")
-        self._empty_label.setVisible(False)
-
-        self.recv_card = Card("任务接收")
-        self._recv_badge = StatusBadge("接收 开启", tone="success")
-        self.recv_card.add(self._recv_badge)
-
-        self.auto_card = Card("自动续接")
-        self._auto_note = QLabel("Fake：续接许可与计数由 T15 工作台提供。")
-        self._auto_note.setWordWrap(True)
-        self.auto_card.add(self._auto_note)
-
-        self.conn_card = Card("连接")
-        self._conn_badge = StatusBadge("连接 正常", tone="success")
-        self._conn_source = QLabel("Fake：未连接 OpenChamber / Reasonix")
-        self._conn_source.setWordWrap(True)
-        self.conn_card.add(self._conn_badge)
-        self.conn_card.add(self._conn_source)
-
-        self.refresh_button = SecondaryButton("刷新占位")
-        self.focus_target = self.refresh_button
-
-        for w in (self.task_card, self._empty_label, self.recv_card, self.auto_card, self.conn_card, self.refresh_button):
-            main_lay.addWidget(w)
-        main_lay.addStretch(1)
-
-        self.rail = Card("进展栏占位")
-        rail_note = QLabel(
-            "右进展栏 294–330px：累计/连续续接计数、阶段条、近期事件（T15 工作台实现）。窄屏时该栏自动下移为单列。"
-        )
-        rail_note.setWordWrap(True)
-        self.rail.add(rail_note)
-        self.rail.setMinimumWidth(294)
-        self.rail.setMaximumWidth(330)
-
-        grid.addWidget(self._main)
-        grid.addWidget(self.rail)
-        self._outer.addWidget(self._grid_row)
-        self._outer.addStretch(1)
-
-        self.render(snapshot)
-
-    # ------------------------------------------------------------- 渲染
-
-    def render(self, snapshot: ApplicationSnapshot) -> None:
-        active = snapshot.active_task
-        self._empty_label.setVisible(active is None)
-        self.task_card.setVisible(active is not None)
-        if active is not None:
-            self._task_title.setText(active.title or "未指定")
-            self._task_id.setText(f"task_id：{active.task_id or '未指定'}")
-            self._task_meta.setText(
-                f"project：{active.project or '未指定'}｜session：{active.session or '未指定'}"
-            )
-            state = active.state or "未知"
-            tone = _STATE_TONE.get(state, "neutral")
-            self._state_badge.set_tone(tone)
-            self._state_badge.set_value(state)
-        self._recv_badge.set_tone("success" if snapshot.receiving_enabled else "neutral")
-        self._recv_badge.set_value("接收 开启" if snapshot.receiving_enabled else "接收 已暂停")
-        self._conn_badge.set_tone("success" if snapshot.connection_healthy else "recovering")
-        self._conn_badge.set_value("连接 正常" if snapshot.connection_healthy else "连接 异常/未知")
-        self._conn_source.setText(snapshot.connection_source or "Fake：未连接执行端")
-
-    # ------------------------------------------------------------- 响应式
-
-    @property
-    def is_single_column(self) -> bool:
-        return not self._rail_in_row
-
-    def set_single_column(self, flag: bool) -> None:
-        """narrow：右栏下移为单列；否则恢复并排。只改布局，不动数据。"""
-        if flag == self.is_single_column:
-            return
-        grid = self._grid_row.layout()
-        if self._rail_in_row:
-            grid.removeWidget(self.rail)
-            self._outer.insertWidget(self._outer.count() - 1, self.rail)
-        else:
-            self._outer.removeWidget(self.rail)
-            grid.addWidget(self.rail)
-        self._rail_in_row = not self._rail_in_row
 
 
 class _TasksPage(QWidget):
@@ -452,7 +324,7 @@ class MainWindow(QMainWindow):
         self.body_scroll.viewport().setObjectName("pageRoot")
 
         self.page_stack = QStackedWidget()
-        self.workbench_page = _WorkbenchPage(self._snapshot)
+        self.workbench_page = Dashboard(self._snapshot)
         self.tasks_page = _TasksPage(self._snapshot)
         self.sessions_page = _SimplePage("会话与执行端", "OC 与 Reasonix 分卡、自检、监控（T15+ 实现）")
         self.logs_page = _LogsPage()
@@ -531,12 +403,33 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ 快照更新
 
     def update_snapshot(self, snapshot: ApplicationSnapshot) -> None:
-        """换发新快照并刷新界面（不改对象身份，只换新值）。"""
+        """换发新快照并刷新界面（不改对象身份，只换新值）。
+
+        迟到/过期业务快照在入口被身份守卫拦截（T15-B2 接缝）：当候选快照与
+        当前快照都能提供持久 sequence、且判定为已过期时，直接拒绝，保持
+        当前 Dashboard 与 self._snapshot 均为最新任务。
+        """
+        if self._clearly_superseded(snapshot):
+            return
         self._snapshot = snapshot
         self.workbench_page.render(snapshot)
         self.tasks_page.render(snapshot)
         self._refresh_header(snapshot)
         self._refresh_stop()
+
+    def _clearly_superseded(self, candidate: ApplicationSnapshot) -> bool:
+        """Snapshot 级 gate：仅在双方都有权威 sequence 时判定过期。
+
+        legacy（无 sequence）快照沿用 T14 更新契约直接接受，避免破坏
+        旧调用；身份算法本身全部复用 presenter.is_superseded_update。
+        """
+        cand = candidate.active_task
+        curr = self._snapshot.active_task
+        if cand is None or curr is None:
+            return False
+        if cand.sequence is None or curr.sequence is None:
+            return False
+        return is_superseded_update(candidate, self._snapshot)
 
     def _refresh_header(self, snapshot: ApplicationSnapshot) -> None:
         self._recv_badge.set_tone("success" if snapshot.receiving_enabled else "neutral")
