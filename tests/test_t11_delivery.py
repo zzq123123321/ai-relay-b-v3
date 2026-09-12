@@ -30,7 +30,7 @@ from core.result_commit import (
 from core.scheduler import ScheduleOutcome, Scheduler
 from infra.clock import FakeClock
 from storage.database import Database
-from storage.result_store import ResultStore
+from storage.result_store import ResultStore, ResultStoreError
 from storage.task_store import TaskStore, make_task_key
 
 _V1 = (
@@ -324,18 +324,30 @@ class TestS08Export:
         assert target.read_text(encoding="utf-8") == expected
         assert result.response_text == expected
 
-    def test_s09_malicious_task_id_cannot_escape_reply_dir(self, env, tmp_path):
+    @pytest.mark.parametrize("task_id", [
+        "../../evil",
+        r"..\..\evil",
+        r"C:\Windows\Temp\x",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "LPT1",
+        "dir/name",
+        "中文任务ID",
+        "a:b",
+        "x" * 300,
+    ])
+    def test_s09_malicious_task_id_cannot_escape_reply_dir(self, env, tmp_path, task_id):
         from core.result_commit import sha256_hex
 
         db, _, ops, clock, _ = env
-        evil_task_id = "../../evil"
-        task_key, attempt_id = _start(env, task_id=evil_task_id)
+        task_key, attempt_id = _start(env, task_id=task_id)
         committed = _commit_completed(env, task_key, attempt_id)
         assert committed.result_id == f"res-{attempt_id}"
         root = tmp_path / "replies"
         root.mkdir()
-        evil_hop = tmp_path / "evil"
-        assert not evil_hop.exists()
         export = FileReplyExport(root)
         sink = FakeClipboard()
         service = _make_delivery(env, clock=clock, clipboard=sink,
@@ -343,14 +355,77 @@ class TestS08Export:
         result = service.provide_once()
         assert result.outcome is DeliveryOutcome.OFFERED
         assert result.export_error is None
-        # task_id 原样保留，可回传；但文件只落在 hash 目录下
-        assert "IN_REPLY_TO: ../../evil" in result.response_text
+        # 原始 TaskId 原样保留在 IN_REPLY_TO，可回传；文件只落在 hash 目录下
+        assert f"IN_REPLY_TO: {task_id}" in result.response_text
         indir = root / sha256_hex(task_key)[:32]
         assert indir.is_dir()
         files = list(indir.iterdir())
         assert len(files) == 1
         assert files[0].name == f"1_{f'res-{attempt_id}'}.response.txt"
+        for entry in indir.iterdir():
+            assert entry.resolve().is_relative_to(root.resolve())
         assert [p.name for p in root.iterdir()] == [sha256_hex(task_key)[:32]]
-        assert not evil_hop.exists()
         names = sorted(p.name for p in tmp_path.iterdir())
         assert names == ["replies", "t11.sqlite", "t11.sqlite-shm", "t11.sqlite-wal"]
+
+    def test_s09_unit_export_rejects_malicious_identifiers(self, tmp_path):
+        from core.result_commit import sha256_hex
+
+        root = tmp_path / "replies"
+        root.mkdir()
+        export = FileReplyExport(root)
+        # 净化层直接拒绝：路径分隔符 / 反斜杠 / 冒号 / 点段逃逸
+        for malicious_result_id in (
+            "../../pwn", r"..\..\pwn", r".\oops\..\pwn2",
+            r"C:\Windows\Temp\x", "a/b",
+        ):
+            with pytest.raises(ResultStoreError):
+                export.export(response_text="R", task_key="x",
+                              result_id=malicious_result_id, revision=1)
+        assert not (tmp_path / "pwn").exists()
+        assert not (tmp_path / "pwn2").exists()
+        # task_key 只进哈希；Windows 保留名/路径名/中文作为 task_key 永不逃逸
+        for hostile_task in ("CON", r"C:\Windows\Temp\x", r"..\..\evil", "中文任务ID"):
+            export.export(response_text="R", task_key=hostile_task,
+                          result_id="res-ok", revision=1)
+            d = root / sha256_hex(hostile_task)[:32]
+            files = list(d.iterdir())
+            assert len(files) == 1
+            written = files[0].resolve()
+            assert written.is_relative_to(root.resolve())
+            assert written.parent == d
+            assert written.read_text(encoding="utf-8") == "R"
+        # 保留名作为 result_id 只能出现在带前缀的安全文件名中
+        for reserved in ("CON", "PRN", "AUX", "NUL", "COM1", "LPT1"):
+            export.export(response_text="R", task_key="y",
+                          result_id=reserved, revision=1)
+            d = root / sha256_hex("y")[:32]
+            assert (d / f"1_{reserved}.response.txt").read_text(encoding="utf-8") == "R"
+
+
+class TestMarkFailed:
+    def test_mark_failed_after_clipboard_success_leaves_recoverable(self, env):
+        db, _, ops, clock, _ = env
+        task_key, attempt_id = _start(env)
+        committed = _commit_completed(env, task_key, attempt_id)
+        sink = FakeClipboard()
+        ops._fault_step = 0
+        ops.fault_inject_after = 1  # mark_offered 的第一个写检查点故障注入
+        service = DeliveryService(db, result_store=ops, clock=clock,
+                                  clipboard=sink)
+        result = service.provide_once()
+        assert result.outcome is DeliveryOutcome.MARK_FAILED
+        assert len(sink.writes) == 1  # 剪贴板副作用发生过一次，绝不自动重写
+        assert _outbox_row(db, f"deliv-{committed.revision}")[1] == "PENDING"
+        authoritative = ops.get_authoritative_for_task(task_key)
+        assert authoritative is not None
+        assert authoritative.state == "COMPLETED"  # Result/Task/Attempt 不变
+        # 显式恢复：清除故障后再提供成功，且补发同一文本
+        ops._fault_step = 0
+        ops.fault_inject_after = None
+        good = FakeClipboard()
+        retried = DeliveryService(db, result_store=ops, clock=clock,
+                                  clipboard=good).provide_once()
+        assert retried.outcome is DeliveryOutcome.OFFERED
+        assert len(good.writes) == 1
+        assert retried.response_text == sink.writes[0]

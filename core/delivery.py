@@ -20,6 +20,8 @@ replies/<task_key_hash>/ 下；task_id 不进入路径，恶意 task_id 无法�
 
 from __future__ import annotations
 
+import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -48,11 +50,18 @@ class ReplyExport(Protocol):
                revision: int) -> None: ...
 
 
+_SAFE_FILENAME_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
 class FileReplyExport:
     """把 RESPONSE 逐字导出到 replies/<task_hash>/<revision>_<result_id>.response.txt。
 
-    路径安全：目录取 sha256(task_key) 前缀，文件名只用系统生成的
-    revision/result_id（不含用户 task_id），恶意 task_id 无法逃出 root（S09）。
+    路径安全（S09）：
+    - 目录只由 sha256(task_key) 前缀生成，用户可控的 task_id/task_key 永远进不了目录名；
+    - 文件名里的 result_id 先做净化校验（仅安全字符、非空、不以点开头），
+      路径分隔符/冒号/系统保留写法一律拒绝，保证构造出的路径不可能逃出目录；
+    - 落盘前再做 resolve 双重包含检查（含 both is_relative_to(root) 与父目录相等），
+      防御性兜底。恶意 task_id 原样保留在 RESPONSE 的 IN_REPLY_TO，可正常回传。
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -60,19 +69,29 @@ class FileReplyExport:
 
     def export(self, *, response_text: str, task_key: str, result_id: str,
                revision: int) -> None:
+        if not _SAFE_FILENAME_PART.fullmatch(result_id):
+            raise ResultStoreError(
+                f"result_id 不符合安全文件名格式，拒绝导出命名：{result_id!r}"
+            )
         directory = self.root / sha256_hex(task_key)[:32]
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{revision}_{result_id}.response.txt"
         resolved_target = target.resolve()
+        if not resolved_target.is_relative_to(self.root):
+            raise ResultStoreError(
+                f"回复文件逃出 replies 根目录被拒绝：{resolved_target}"
+            )
         if resolved_target.parent != directory:
-            raise ResultStoreError(f"恶意回复文件路径被拒绝：{target}")
+            raise ResultStoreError(
+                f"回复文件不在任务 hash 目录内被拒绝：{resolved_target}"
+            )
         target.write_text(response_text, encoding="utf-8")
 
 
 class DeliveryOutcome:
     OFFERED = "offered"
     NO_PENDING = "no_pending"
-    NOT_OFFERED = "not_offered"
+    MARK_FAILED = "mark_failed"
 
 
 class DeliveryResult:
@@ -135,13 +154,23 @@ class DeliveryService:
                 export_error = f"{type(exc).__name__}: {exc}"
         self._clipboard.write_text(text=result.protocol_text)
         now_iso = _utc_iso(self._clock.now())
-        with self._db.transaction():
-            marked = self._ops.mark_offered_in(
-                self._db.connection, delivery_id=head.delivery_id, now=now_iso
+        try:
+            with self._db.transaction():
+                marked = self._ops.mark_offered_in(
+                    self._db.connection, delivery_id=head.delivery_id, now=now_iso
+                )
+        except (sqlite3.Error, ResultStoreError) as exc:
+            # R1 crash window：剪贴板副作用已发生，但 OFFERED 落库失败。
+            # 不自动重写剪贴板；返回结构化 MARK_FAILED，Outbox 仍 PENDING，
+            # 显式恢复时可能再次提供（R1 无 ACK/无法与外部副作用原子化）。
+            return DeliveryResult(
+                DeliveryOutcome.MARK_FAILED,
+                delivery_id=head.delivery_id,
+                export_error=export_error,
             )
         if not marked:
             return DeliveryResult(
-                DeliveryOutcome.NOT_OFFERED,
+                DeliveryOutcome.MARK_FAILED,
                 delivery_id=head.delivery_id,
                 export_error=export_error,
             )
