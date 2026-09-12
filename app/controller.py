@@ -12,7 +12,9 @@
   REJECTED/UNKNOWN 绝不自动重发、绝不自动冒充足完成；提交存储故障（含注入的
   sqlite3.IntegrityError）结构化返回 COMMIT_STORE_ERROR，不吞异常、不改权威；
 - offer_next_result：先 D01 gate（存在本进程未确认的 OFFERED 结果 → 阻塞），
-  再 D08 入站预检（剪贴板上是未持久化的入站 TASK → 阻塞，不覆盖丢任务），
+  再 D08 入站预检（只有能证明「不是待处理 Relay TASK 或已持久」的内容才允许覆盖：
+  QUEUE_FULL/ERROR/CONFLICT/IGNORED_BAD_PROTOCOL/IGNORED_NOT_A_TASK 一律阻塞，
+  本端最近一次自写文本视为已持久出站放行），
   最后 DeliveryService.provide_once 提供不可变 protocol_text；
 - confirm_local_delivery：把当前 OFFERED 的 delivery_id 记入进程内确认集合；
   重启后集合清空 → 再次 D01 安全侧失败（宁可重复阻塞，不重复覆盖剪贴板）。
@@ -55,6 +57,16 @@ from storage.result_store import ResultStore
 from storage.task_store import TaskStore
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:57123"
+
+# D08 入站预检的阻塞结论：只有这些才证明「尚未持久入站 / 具 Relay envelope 候选特征」，
+# 一律禁止覆盖剪贴板。其余（ACCEPTED/EXISTING/IGNORED_PLAIN_TEXT）已证明安全。
+_D08_BLOCKED_KINDS = frozenset({
+    ReceiveOutcomeKind.QUEUE_FULL,          # 尚未成功持久
+    ReceiveOutcomeKind.ERROR,               # 未提交，绝不可标「已看过」
+    ReceiveOutcomeKind.CONFLICT,            # 内容冲突（同一 ID 不同正文）
+    ReceiveOutcomeKind.IGNORED_BAD_PROTOCOL,  # Relay envelope 但协议损坏/未完整复制
+    ReceiveOutcomeKind.IGNORED_NOT_A_TASK,  # Relay envelope 但非可入站 TASK（RESPONSE 等）
+})
 
 
 # ---------------------------------------------------------------- deterministic factories
@@ -162,6 +174,7 @@ class AppController:
         self._endpoint = endpoint
         self._executor = executor
         self._confirmed_offered: set[str] = set()
+        self._last_written_text: str | None = None  # 最近一次本端写入剪贴板的文本
 
         tasks = task_store if task_store is not None else TaskStore(db)
         self._task_store = tasks
@@ -390,20 +403,20 @@ class AppController:
             )
 
         text = self._clipboard.text() or ""
-        if text.strip() and looks_like_relay_message(text):
-            received = self._receive.execute(text, reason="D08_PRE_OFFER")
-            if received.kind in (
-                ReceiveOutcomeKind.QUEUE_FULL,
-                ReceiveOutcomeKind.ERROR,
-                ReceiveOutcomeKind.CONFLICT,
-            ):
-                return OfferResult(
-                    OfferKind.BLOCKED_INBOUND_NOT_PERSISTED, write_calls=0,
-                    detail=(
-                        f"D08 入站预检未通过（kind={received.kind.value}）："
-                        "剪贴板存在未持久化的入站任务，拒绝覆盖"
-                    ),
-                )
+        if text.strip():
+            # 本端最近一次写入的结果文本 = 已持久出站，证明「不是待处理入站」，
+            # 视同 IGNORED_SELF_WRITE，允许覆盖（避免把上一份 RESPONSE 误当外来的
+            # pending-inbound 无限阻塞；重启后记忆清空 → 一律按外来文本安全侧失败）。
+            if text != self._last_written_text and looks_like_relay_message(text):
+                received = self._receive.execute(text, reason="D08_PRE_OFFER")
+                if received.kind in _D08_BLOCKED_KINDS:
+                    return OfferResult(
+                        OfferKind.BLOCKED_INBOUND_NOT_PERSISTED, write_calls=0,
+                        detail=(
+                            f"D08 入站预检未通过（kind={received.kind.value}）："
+                            "剪贴板存在未持久化/不可证明已持久的入站 Relay 内容，拒绝覆盖"
+                        ),
+                    )
 
         try:
             result = self._delivery.provide_once()
@@ -412,11 +425,15 @@ class AppController:
                 OfferKind.CLIPBOARD_WRITE_FAILED, write_calls=1, detail=str(exc),
             )
         if result.outcome is DeliveryOutcome.OFFERED:
+            self._last_written_text = result.response_text
             return OfferResult(
                 OfferKind.OFFERED, delivery_id=result.delivery_id,
                 response_text=result.response_text, write_calls=1,
             )
         if result.outcome is DeliveryOutcome.MARK_FAILED:
+            # 剪贴板副作用已发生（写成功、OFFERED 落库失败）：同样记入自写，防止
+            # 同进程内把已写入的文本误判为外来 pending-inbound。
+            self._last_written_text = result.response_text
             return OfferResult(
                 OfferKind.MARK_FAILED, delivery_id=result.delivery_id,
                 write_calls=1, detail=result.export_error or "mark_offered 落库失败",

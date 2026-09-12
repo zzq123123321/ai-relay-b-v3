@@ -323,7 +323,7 @@ class TestOffer:
 
     def test_mark_failed_leaves_pending_recoverable(self, make_env):
         env = make_env()
-        _accept(env, "c-mark")
+        raw = _accept(env, "c-mark")
         _, ctl = _start(env)
         ctl.run_one_fake_cycle()
         # 独立 ResultStore 在 mark_offered 落库时故障注入 → 透传为 MARK_FAILED
@@ -340,9 +340,8 @@ class TestOffer:
         assert result.kind is OfferKind.MARK_FAILED
         assert result.write_calls == 1  # 剪贴板副作用已发生一次，绝不自动重写
         assert ctl2.stats()["outbox_pending"] == 1
-        # 清除故障后显式补发：同一权威文本，不做第二次写之前先确认落库成功
-        ops._fault_step = 0
-        ops.fault_inject_after = None
+        # 清除故障后显式补发。剪贴板此刻是本端已写入的 RESPONSE：新进程无法证明其
+        # 「非待处理入站」，按 D08 安全侧失败 → 操作者重新贴回已持久入站任务文本。
         good = AppController(
             env["db"], settings=env["settings"], clipboard=env["clipboard"],
             clock=FakeClock(wall=_WALL), executor=FakeExecutor(),
@@ -350,6 +349,12 @@ class TestOffer:
                                      clock=FakeClock(wall=_WALL),
                                      clipboard=env["clipboard"]),
         )
+        blocked = good.offer_next_result()
+        assert blocked.kind is OfferKind.BLOCKED_INBOUND_NOT_PERSISTED
+        assert blocked.write_calls == 0
+        env["clipboard"].setText(raw)  # 操作者重现已持久化入站 → EXISTING → 放行
+        ops._fault_step = 0
+        ops.fault_inject_after = None
         offered = good.offer_next_result()
         assert offered.kind is OfferKind.OFFERED
         assert offered.response_text == env["clipboard"].writes[0]
@@ -379,7 +384,14 @@ class TestOffer:
 
 
 class TestD08:
+    def _commit_pending(self, env, task_id: str) -> str:
+        raw = _accept(env, task_id)
+        _, ctl = _start(env)
+        assert ctl.run_one_fake_cycle().kind is CycleKind.COMMITTED
+        return raw
+
     def test_d08_queue_full_blocks_offer(self, make_env):
+        #（必需场景 1）合法新 TASK + 存储故障/占用不足：未持久 → 阻塞，write=0
         env = make_env(queue_capacity=1)
         _accept(env, "d08-q")  # 占用已满，且已持久化
         env["clipboard"].setText(_v1("d08-unclaimed", "占满配额后的新任务"))
@@ -388,12 +400,15 @@ class TestD08:
         assert result.write_calls == 0
 
     def test_d08_error_blocks_offer(self, make_env):
+        #（必需场景 1）storage fault：认领失败（未提交）→ ERROR → 阻塞
         env = make_env(task_fault_step=1)  # 下一次认领必然失败（未提交）→ ERROR
-        env["clipboard"].setText(_v1("d08-error", "认领会失败的任务"))
+        unclaimed = _v1("d08-error", "认领会失败的任务")
+        env["clipboard"].setText(unclaimed)
         result = env["ctl"].offer_next_result()
         assert result.kind is OfferKind.BLOCKED_INBOUND_NOT_PERSISTED
         assert result.write_calls == 0
         assert env["ctl"].stats()["tasks"] == 0  # 未持久化，绝不覆盖
+        assert env["clipboard"].text() == unclaimed  # 原始输入保持不动
 
     def test_d08_conflict_blocks_offer(self, make_env):
         env = make_env()
@@ -403,9 +418,65 @@ class TestD08:
         assert result.kind is OfferKind.BLOCKED_INBOUND_NOT_PERSISTED
         assert result.write_calls == 0
 
+    def test_d08_malformed_relay_blocks_and_preserves(self, make_env):
+        #（必需场景 2）Relay-looking 但 malformed TASK：IGNORED_BAD_PROTOCOL → 阻塞
+        env = make_env()
+        self._commit_pending(env, "d08-mal")
+        env["clipboard"].setText("AI_RELAY/1\n残\n")  # 协议损坏/未完整复制
+        result = env["ctl"].offer_next_result()
+        assert result.kind is OfferKind.BLOCKED_INBOUND_NOT_PERSISTED
+        assert result.write_calls == 0
+        assert env["clipboard"].text() == "AI_RELAY/1\n残\n"  # 原始输入保持不动
+
+    def test_d08_external_response_blocks_offer(self, make_env):
+        #（必需场景 3）外来的 TYPE RESPONSE / 非可入站 TASK 的 Relay envelope：
+        # 本端未写过的 RESPONSE 不可按「普通文本」误判 → 必须阻塞
+        env = make_env()
+        self._commit_pending(env, "d08-resp")
+        env["clipboard"].setText(_response("external-1"))  # 模拟 A 端复制来的 RESPONSE
+        result = env["ctl"].offer_next_result()
+        assert result.kind is OfferKind.BLOCKED_INBOUND_NOT_PERSISTED
+        assert result.write_calls == 0
+
+    def test_d08_own_last_response_allows_continue(self, make_env):
+        # 本端最近一次自写的 RESPONSE = 已持久出站 → 放行（供多结果顺序提供）
+        env = make_env()
+        self._commit_pending(env, "d08-self")
+        env["clipboard"].setText(_v1("d08-s3"))
+        first = env["ctl"].offer_next_result()
+        assert first.kind is OfferKind.OFFERED
+        assert first.write_calls == 1
+        env["ctl"].confirm_local_delivery()
+        # 剪贴板此刻是本端自写 RESPONSE：不被 D08 误杀，且没有更多 PENDING → NO_PENDING
+        again = env["ctl"].offer_next_result()
+        assert again.kind is OfferKind.NO_PENDING
+
+    def test_d08_plain_text_allowed(self, make_env):
+        #（必需场景 4）普通中文/URL/路径：明确非 Relay envelope → 可以正常覆盖
+        env = make_env()
+        self._commit_pending(env, "d08-plain")
+        env["clipboard"].setText(r"普通中文和路径 D:\proj\存档.txt 还有 https://example.org/x")
+        result = env["ctl"].offer_next_result()
+        assert result.kind is OfferKind.OFFERED
+        assert result.write_calls == 1
+        assert env["clipboard"].text() == result.response_text
+
     def test_d08_persisted_inbound_does_not_block(self, make_env):
+        #（必需场景 5）已 ACCEPTED/EXISTING 的 TASK：已持久 → 可以继续 offer
         env = make_env()
         _accept(env, "d08-ok")
         result = env["ctl"].offer_next_result()  # 剪贴板就是已持久化的任务
         assert result.kind in (OfferKind.NO_PENDING, OfferKind.OFFERED)
         assert result.write_calls in (0, 1)
+
+    def test_d08_fix_then_persist_then_allow(self, make_env):
+        #（必需场景 6）清除 fault/修复内容：先持久入站 → 再允许 offer
+        env = make_env(task_fault_step=1)
+        raw = _v1("d08-fix", "首轮认领会失败")
+        env["clipboard"].setText(raw)
+        env["ctl"].offer_next_result()  # fault → ERROR → 阻塞（未持久）
+        env["tasks"].fault_inject_after = None
+        result = env["ctl"].accept_task(raw)  # fault 清除后成功持久入站
+        assert result.kind is ReceiveOutcomeKind.ACCEPTED
+        allowed = env["ctl"].offer_next_result()  # 已 EXISTING → 放行
+        assert allowed.kind in (OfferKind.NO_PENDING, OfferKind.OFFERED)
