@@ -22,6 +22,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -192,7 +193,7 @@ class SettingsPage(QWidget):
         self._committed = committed_snapshot
         self._snapshot = snapshot if snapshot is not None else empty_snapshot()
         self._request_id_factory = request_id_factory or (lambda: str(uuid4()))
-        self._directory_picker = directory_picker
+        self._directory_picker = directory_picker if directory_picker is not None else self._default_directory_picker
         self._project_key_resolver = project_key_resolver
 
         self._draft_base: SettingsDraft = SettingsDraft.defaults()
@@ -549,6 +550,7 @@ class SettingsPage(QWidget):
         self._rebase(snapshot_or_none)
         self._restore_controls()
         self._loading = False
+        self._clear_candidate_context(clear_session_hint=True)
         self._recompute_dirty()
         self._render_revision()
 
@@ -588,8 +590,7 @@ class SettingsPage(QWidget):
         self._loading = True
         self._restore_controls()
         self._loading = False
-        self._session_candidate_region = None
-        self._session_hint_label.setText("")
+        self._clear_candidate_context(clear_session_hint=True)
         self._recompute_dirty()
 
     def show_save_feedback(self, message: str, tone: str = "neutral") -> None:
@@ -599,8 +600,6 @@ class SettingsPage(QWidget):
     # ------------------------------------------------------------ 目录 / 上下文
 
     def _on_pick_directory(self) -> None:
-        if self._directory_picker is None:
-            return
         picked = self._directory_picker()
         if not picked:  # 用户取消：无变化
             return
@@ -619,8 +618,8 @@ class SettingsPage(QWidget):
         if current == self._last_context:
             return
         self._last_context = current
-        self._pending_requests.clear()
         self._handle_session_region_change(directory, url)
+        self._clear_candidate_context()
 
     def _display_text(self, path: str) -> str:
         widget = self._widgets[path]
@@ -644,6 +643,37 @@ class SettingsPage(QWidget):
             self._session_hint_label.setText("旧目录候选会话已失效，请重新选择")
 
     # ------------------------------------------------------------ 候选刷新
+
+    def _default_directory_picker(self) -> str | None:
+        """生产环境默认：无注入 picker 时使用 QFileDialog。"""
+        return QFileDialog.getExistingDirectory(self, "选择工作目录") or None
+
+    def _replace_candidate_items(self, kind: CandidateKind, values) -> None:
+        """原子替换某区域的候选列表，同时保留当前控件编辑文本。"""
+        combo = self._combo_for_kind(kind)
+        current = combo.currentText()
+        self._loading = True
+        combo.blockSignals(True)
+        combo.clear()
+        for item in values:
+            combo.addItem(item)
+        combo.setCurrentText(current)
+        combo.blockSignals(False)
+        self._loading = False
+
+    def _clear_candidate_context(self, clear_session_hint: bool = False) -> None:
+        """上下文变动 / rebbase 时清空所有候选痕迹，保留人工编辑文本。"""
+        self._pending_requests.clear()
+        for kind in (CandidateKind.SESSION, CandidateKind.AGENT, CandidateKind.MODEL):
+            self._replace_candidate_items(kind, ())
+        self._candidate_region.clear()
+        self._candidate_source.clear()
+        for label in self._candidate_source_labels.values():
+            label.setText("")
+        self._meta_detail.setText("")
+        self._session_candidate_region = None
+        if clear_session_hint:
+            self._session_hint_label.setText("")
 
     def _on_refresh(self, kind: CandidateKind) -> None:
         url = self._display_text("openchamber.url")
@@ -684,8 +714,8 @@ class SettingsPage(QWidget):
             self._recompute_dirty()
             return True
 
-        self._candidate_region[result.region.kind] = result.region
         if result.error:
+            # 失败：保留旧候选与旧 candidate_region，仅显示刷新失败
             self._candidate_source_labels[result.region.kind].setText(
                 f"刷新失败：{result.error}"
             )
@@ -693,15 +723,8 @@ class SettingsPage(QWidget):
             self._recompute_dirty()
             return True
 
-        combo = self._combo_for_kind(result.region.kind)
-        manual = combo.currentText()
-        self._loading = True
-        for item in result.values:
-            if combo.findText(item) < 0:
-                combo.addItem(item)
-        if manual == "" or combo.currentText() != manual:
-            combo.setCurrentText(manual)
-        self._loading = False
+        self._replace_candidate_items(result.region.kind, result.values)
+        self._candidate_region[result.region.kind] = result.region
 
         if result.region.kind == CandidateKind.SESSION:
             if not result.values:

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -448,3 +448,157 @@ class TestSafety:
         assert "import requests" not in src
         assert "import urllib" not in src
         assert "import socket" not in src
+
+
+# ---------------------------------------------------------------- B2R helpers
+
+def _items(combo):
+    return [combo.itemText(i) for i in range(combo.count())]
+
+
+def _apply(page, kind, values, region=None, request_id="r", source="s", error=None):
+    region = region or _region(kind)
+    page._pending_requests[kind] = CandidateRequest(request_id=request_id, region=region)
+    page.apply_candidate_result(
+        CandidateResult(
+            request_id=request_id,
+            region=region,
+            values=values,
+            source=source,
+            error=error,
+        )
+    )
+
+
+def _flatten(mapping, prefix=""):
+    out = set()
+    for k, v in mapping.items():
+        p = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out |= _flatten(v, p)
+        else:
+            out.add(p)
+    return out
+
+
+# ---------------------------------------------------------------- B2R tests
+
+class TestDirectoryPickerDefault:
+    def test_production_default_picker(self, monkeypatch):
+        page = SettingsPage()
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: "D:\\work")
+        page._on_pick_directory()
+        assert page.build_draft()["openchamber"]["directory"] == "D:\\work"
+
+    def test_production_picker_cancel(self, monkeypatch):
+        page = SettingsPage()
+        base = page.build_draft()["openchamber"]["directory"]
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: "")
+        page._on_pick_directory()
+        assert page.build_draft()["openchamber"]["directory"] == base
+
+
+class TestCandidateReplacement:
+    def test_model_replacement(self):
+        page = SettingsPage()
+        _apply(page, CandidateKind.MODEL, ("A1", "A2"))
+        page.model_combo.setCurrentText("M-user")
+        _apply(page, CandidateKind.MODEL, ("B1", "B2"))
+        assert _items(page.model_combo) == ["B1", "B2"]
+        assert page.model_combo.currentText() == "M-user"
+
+    def test_agent_replacement(self):
+        page = SettingsPage()
+        _apply(page, CandidateKind.AGENT, ("A1", "A2"))
+        _apply(page, CandidateKind.AGENT, ("B1", "B2"))
+        assert _items(page.agent_combo) == ["B1", "B2"]
+
+    def test_session_replacement(self):
+        page = SettingsPage()
+        _apply(page, CandidateKind.SESSION, ("S1", "S2"))
+        _apply(page, CandidateKind.SESSION, ("S3",))
+        assert _items(page.session_combo) == ["S3"]
+
+    def test_empty_clears_old(self):
+        page = SettingsPage()
+        _apply(page, CandidateKind.MODEL, ("M1", "M2"))
+        assert _items(page.model_combo) == ["M1", "M2"]
+        _apply(page, CandidateKind.MODEL, ())
+        assert _items(page.model_combo) == []
+        assert page.dirty is False
+
+    def test_error_preserves_old_items_and_region(self):
+        page = SettingsPage()
+        old_region = _region(CandidateKind.MODEL, directory="/proj")
+        _apply(page, CandidateKind.MODEL, ("M1",), region=old_region)
+        assert page._candidate_region[CandidateKind.MODEL] == old_region
+        _apply(page, CandidateKind.MODEL, (), source="x", error="网络不可达")
+        assert _items(page.model_combo) == ["M1"]
+        assert page._candidate_region[CandidateKind.MODEL] == old_region
+
+
+class TestContextChangeClearsCandidate:
+    def _prepopulate(self, page):
+        _apply(page, CandidateKind.MODEL, ("M1",), source="m-src")
+        _apply(page, CandidateKind.AGENT, ("A1",), source="a-src")
+        _apply(page, CandidateKind.SESSION, ("S1",), source="s-src")
+        page._meta_detail.setText("k: v")
+
+    def test_directory_change_clears_all(self):
+        page = SettingsPage(directory_picker=lambda: "/new")
+        self._prepopulate(page)
+        page.model_combo.setCurrentText("M-man")
+        page._on_pick_directory()
+        assert _items(page.model_combo) == []
+        assert _items(page.agent_combo) == []
+        assert _items(page.session_combo) == []
+        assert page._candidate_region == {}
+        assert page._meta_detail.text() == ""
+        assert page.model_combo.currentText() == "M-man"
+        assert page.agent_combo.currentText() == _base_draft()["openchamber"]["agent"]
+
+    def test_endpoint_change_clears_all(self):
+        page = SettingsPage()
+        self._prepopulate(page)
+        page.model_combo.setCurrentText("M-man")
+        page._widgets["openchamber.url"].setText("http://new")
+        assert _items(page.model_combo) == []
+        assert page._candidate_region == {}
+        assert page._meta_detail.text() == ""
+        assert page.model_combo.currentText() == "M-man"
+
+
+class TestRebaseClearsCandidate:
+    def _prepopulate(self, page):
+        _apply(page, CandidateKind.MODEL, ("M1",), source="src")
+        _apply(page, CandidateKind.SESSION, ("S1",), source="src")
+        page._session_hint_label.setText("some hint")
+
+    def test_set_committed_clears(self):
+        page = SettingsPage()
+        self._prepopulate(page)
+        snap = _snapshot()
+        page.set_committed_snapshot(snap)
+        assert _items(page.model_combo) == []
+        assert _items(page.session_combo) == []
+        assert page._candidate_region == {}
+        assert page._session_hint_label.text() == ""
+        assert page.build_draft() == config_to_dict(snap.config)
+
+    def test_discard_clears(self):
+        page = SettingsPage()
+        self._prepopulate(page)
+        page.model_combo.setCurrentText("X")
+        page.discard_changes()
+        assert _items(page.model_combo) == []
+        assert page._candidate_region == {}
+        assert page._session_hint_label.text() == ""
+        assert page.dirty is False
+
+
+class TestRegistryContract:
+    def test_fields_match_defaults_paths(self):
+        fields = {f.path for f in FIELDS}
+        leaves = _flatten(dict(SettingsDraft.defaults()))
+        assert leaves == fields
+        assert len(fields) == 62
