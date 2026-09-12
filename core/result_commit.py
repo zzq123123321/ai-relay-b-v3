@@ -1,14 +1,21 @@
-"""AI Relay B V3.0：权威结果原子提交（T11）。
+"""AI Relay B V3.0：权威结果原子提交（T11）+ 正常完成项目执行权安全释放（T11R）。
 
 依据：主规格 04.3 结果事务、17.2 结果内容与版本、17.5 S04/S05/S06；
 任务卡：同一事务提交 result、task/attempt 终态、Outbox 与消息认领。
+
+T11R：权威完成 + 远端安全空闲 IDLE_VERIFIED 时，在同一个结果事务内按
+task/attempt/epoch 精确释放 ACTIVE project lease（release_active_in）。非 ACTIVE
+（QUARANTINED/ROTATING）、owner/epoch 不匹配、远端非 IDLE_VERIFIED 一律保留项目执行权；
+lease 不存在不视为释放成功也不回滚合法结果。project_key 只取自 Attempt 已冻结的
+execution_snapshot_json，Candidate 不能决定释放哪个项目。
 
 不变量（核心价值）：
 - 权威 = task.current_result_revision 指向的不可变 result revision；
 - 提交前在 BEGIN IMMEDIATE 事务内重新校验 task/attempt 的 active_attempt_id 与
   authority_epoch（双重 CAS），旧 worker/旧 attempt/旧 epoch 一律 LOST_AUTHORITY；
 - 同一事务完成：INSERT result → 发布 task/attempt 终态 → INSERT outbox →
-  消息认领 → 关键审计事件；任一步 SQL 失败整事务回滚（S04）；
+  消息认领 → 安全条件满足时精确释放 ACTIVE lease → 关键审计事件；任一步 SQL 失败
+  整事务回滚（S04），release 的 DELETE 也随事务回滚；
 - 相同结果重复提交幂等 ALREADY_COMMITTED；同 result_id 异正文
   RESULT_ID_CONFLICT；双 worker 竞争只有一方赢得提交（S05）；
 - R1 protocol_text 在提交时以不可变方式生成（含固定 RESPONSE MESSAGE_ID=result_id，
@@ -20,6 +27,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -31,6 +39,11 @@ from core.domain import AttemptStatus, TaskStatus, transition_attempt, transitio
 from core.protocol_v1 import ProtocolFormat, wrap_response
 from infra.clock import Clock, SystemClock
 from storage.database import Database
+from storage.lease_store import (
+    LeaseReleaseOutcome,
+    LeaseReleaseResult,
+    ProjectLeaseStore,
+)
 from storage.result_store import ResultStore, ResultStoreError
 
 _COMMIT_STATE_TASK_ATTEMPT: Mapping[str, tuple[str, TaskStatus, AttemptStatus]] = {
@@ -42,6 +55,8 @@ _COMMIT_STATE_TASK_ATTEMPT: Mapping[str, tuple[str, TaskStatus, AttemptStatus]] 
 
 _STATE_ACTIVE = "ACTIVE"
 _STATE_OPEN = "OPEN"
+
+_SAFE_RELEASE_REMOTE_STATE = "IDLE_VERIFIED"
 
 ResultIdFactory = Callable[[str, str, int], str]
 DeliveryIdFactory = Callable[[str, int], str]
@@ -148,6 +163,7 @@ class ResultCommitService:
         db: Database,
         *,
         result_store: ResultStore | None = None,
+        lease_store: ProjectLeaseStore | None = None,
         clock: Clock | None = None,
         result_id_factory: ResultIdFactory | None = None,
         delivery_id_factory: DeliveryIdFactory | None = None,
@@ -155,6 +171,7 @@ class ResultCommitService:
     ) -> None:
         self._db = db
         self._ops = result_store if result_store is not None else ResultStore(db)
+        self._leases = lease_store if lease_store is not None else ProjectLeaseStore(db)
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._result_id_factory = result_id_factory or _uuid_result_id
         self._delivery_id_factory = delivery_id_factory or _uuid_delivery_id
@@ -295,6 +312,14 @@ class ResultCommitService:
                         task_key=candidate.task_key,
                         result_id=candidate.result_id,
                     )
+                lease_note = self._release_completed_lease_in(
+                    conn,
+                    task_key=candidate.task_key,
+                    attempt_id=candidate.attempt_id,
+                    authority_epoch=candidate.authority_epoch,
+                    result_state=candidate.result_state,
+                    remote_state=candidate.remote_state,
+                )
                 self._ops.append_commit_event_in(
                     conn,
                     event_id=self._event_id_factory(candidate.result_id),
@@ -308,7 +333,7 @@ class ResultCommitService:
                     CommitOutcome.COMMITTED,
                     result_id=candidate.result_id,
                     revision=revision,
-                    detail=f"revision={revision} 权威提交成功",
+                    detail=f"revision={revision} 权威提交成功{lease_note}",
                 )
         except sqlite3.IntegrityError as exc:
             message = str(exc)
@@ -319,6 +344,72 @@ class ResultCommitService:
             ) from exc
 
     # ---------------------------------------------------------------- gates
+
+    def _release_completed_lease_in(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_key: str,
+        attempt_id: str,
+        authority_epoch: int,
+        result_state: str,
+        remote_state: str,
+    ) -> str:
+        """同一结果事务内的正常完成安全释放（T11R）。
+
+        只在“成功权威完成 + 远端安全空闲 IDLE_VERIFIED”且能精确解析出项目身份时，
+        尝试按 task/attempt/epoch 精确释放 ACTIVE lease。其余情况一律不触碰 lease：
+        - lease 不存在：继续，不视为释放成功（也不回滚合法结果）；
+        - owner/attempt/epoch 不一致：绝不删除（防误删他人/新代 owner）；
+        - QUARANTINED/ROTATING：保留，只允许后续只读核验/人工风险确认解除；
+        - 无法从 Attempt 冻结执行快照解析 project_key：跳过释放，仍完成提交。
+        返回一段只读解释文本（不做业务判断依据）；失败信号由调用方最终 CommitResult 承载。
+        """
+        if result_state != "COMPLETED":
+            return "；非 COMPLETED 终态，未释放项目执行权"
+        if remote_state != _SAFE_RELEASE_REMOTE_STATE:
+            return f"；远端状态 {remote_state!r} 非 IDLE_VERIFIED，不释放项目执行权"
+        project_key = self._attempt_project_key_in(conn, attempt_id)
+        if project_key is None:
+            return "；无法从 Attempt 执行快照解析 project_key，跳过 lease 释放"
+        release: LeaseReleaseResult = self._leases.release_active_in(
+            conn,
+            project_key=project_key,
+            owner_task_key=task_key,
+            owner_attempt_id=attempt_id,
+            authority_epoch=authority_epoch,
+        )
+        if release.outcome is LeaseReleaseOutcome.RELEASED:
+            return f"；项目 {project_key} lease 已安全释放（同事务）"
+        if release.outcome is LeaseReleaseOutcome.NOT_FOUND:
+            return f"；项目 {project_key} 无 lease 记录，未执行释放"
+        if release.outcome is LeaseReleaseOutcome.OWNER_MISMATCH:
+            return f"；项目 {project_key} lease owner 与权威不匹配，保留并绝不删除"
+        return f"；项目 {project_key} lease 状态不允许正常释放，保留"
+
+    def _attempt_project_key_in(
+        self, conn: sqlite3.Connection, attempt_id: str
+    ) -> str | None:
+        """从 Attempt 已冻结的 execution_snapshot_json 解析 project_key（T11R）。
+
+        project 身份必须来自 T09 冻结的不可变执行快照（receive.project_key），
+        不允许 Candidate 自行决定释放哪个项目。快照缺失/损坏/无 project_key 时返回 None，
+        调用方应跳过释放而不是猜测。
+        """
+        row = conn.execute(
+            "SELECT execution_snapshot_json FROM attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        try:
+            data = json.loads(row[0])
+            project_key = data["receive"]["project_key"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(project_key, str) or not project_key.strip():
+            return None
+        return project_key
 
     def _authority_gate(
         self, candidate: CandidateResult, task_row, conn
