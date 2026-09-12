@@ -38,9 +38,13 @@ PEER_ID_LEGACY_DEFAULT = "legacy-default"
 
 
 class IngressErrorCode(Enum):
-    PROTOCOL = "protocol_error"
+    """入站拒绝原因稳定码；T08 起使用规范命名，PROTOCOL/NOT_FROM_CHATGPT 为 T07 别名。"""
+
+    PROTOCOL_ERROR = "protocol_error"
+    PROTOCOL = "protocol_error"  # T07 兼容别名
     NOT_TASK = "not_task"
-    NOT_FROM_CHATGPT = "not_from_chatgpt"
+    INVALID_SOURCE = "invalid_source"
+    NOT_FROM_CHATGPT = "invalid_source"  # T07 兼容别名
 
 
 class IngressError(Exception):
@@ -100,7 +104,7 @@ class IngressService:
             message = parse_message(raw_text)
         except ProtocolError as exc:
             raise IngressError(
-                IngressErrorCode.PROTOCOL,
+                IngressErrorCode.PROTOCOL_ERROR,
                 f"入站协议解析失败：{exc.reason}",
                 context={"protocol_code": exc.code.value},
             ) from exc
@@ -113,7 +117,7 @@ class IngressService:
 
         if message.source.upper() != PEER_ID_CHATGPT:
             raise IngressError(
-                IngressErrorCode.NOT_FROM_CHATGPT,
+                IngressErrorCode.INVALID_SOURCE,
                 f"入站 SOURCE 必须为 CHATGPT，实际为 {message.source}",
             )
 
