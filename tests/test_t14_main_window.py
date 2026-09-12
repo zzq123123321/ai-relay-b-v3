@@ -53,13 +53,13 @@ def test_ui_a01_structure_stop_outside_scroll_and_partitions(qapp):
     # 停止入口位于固定顶部层，不在滚动内容区内
     assert win.stop_button.parent().objectName() == "headerBar"
     assert win.body_scroll.findChild(type(win.stop_button)) is None
-    # 分区清楚：主任务/接收/自动续接/连接
+    # 分区清楚：当前任务卡 + 正式三卡（模型/接口连接、原会话自动续接、等待任务数量）
     wb = win.workbench_page
     assert wb.task_card.title_label is not None
-    assert wb.task_card.title_label.text() == "主任务（Fake Snapshot）"
-    assert wb.recv_card.title_label.text() == "任务接收"
-    assert wb.auto_card.title_label.text() == "自动续接"
-    assert wb.conn_card.title_label.text() == "连接"
+    assert wb.task_card.title_label.text() == "当前任务"
+    assert wb.auto_card.title_label.text() == "原会话自动续接"
+    assert wb.conn_card.title_label.text() == "模型/接口连接"
+    assert wb.queue_card.title_label.text() == "等待任务数量"
     # 页面容器
     assert win.page_stack.count() == 5
     assert win.current_page == "PAGE01"
