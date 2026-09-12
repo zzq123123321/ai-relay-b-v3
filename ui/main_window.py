@@ -54,6 +54,7 @@ from .status_presenter import (
     connection_short_label,
     is_superseded_update,
 )
+from .task_records import TaskRecordsPage
 from .theme_tokens import ThemeMode, apply_theme, theme_for_mode
 
 # ------------------------------------------------------------------ 断点
@@ -68,6 +69,13 @@ TIER_MEDIUM = "medium"
 TIER_NARROW = "narrow"
 
 _TIER_NAMES = (TIER_WIDE, TIER_MEDIUM, TIER_NARROW)
+
+_COPY_TONES = {
+    "success": "success",
+    "missing": "neutral",
+    "unavailable": "neutral",
+    "failed": "danger",
+}
 
 
 def tier_for_width(width: int) -> str:
@@ -242,6 +250,9 @@ class MainWindow(QMainWindow):
         snapshot: ApplicationSnapshot | None = None,
         mode: ThemeMode | str = ThemeMode.LIGHT,
         parent=None,
+        *,
+        task_history_provider=None,
+        history_copy_service=None,
     ) -> None:
         super().__init__(parent)
         self._snapshot = snapshot or empty_snapshot()
@@ -250,6 +261,8 @@ class MainWindow(QMainWindow):
         self._current_page: str = PAGE_IDS[0]
         self._page_focus: dict[str, QWidget | None] = {}
         self._widget_page: dict[QWidget, str] = {}
+        self._task_history_provider = task_history_provider
+        self._history_copy = history_copy_service
 
         self._build()
         self._refresh_header(self._snapshot)
@@ -330,7 +343,7 @@ class MainWindow(QMainWindow):
 
         self.page_stack = QStackedWidget()
         self.workbench_page = Dashboard(self._snapshot)
-        self.tasks_page = _TasksPage(self._snapshot)
+        self.tasks_page = self._make_tasks_page()
         self.sessions_page = _SimplePage("会话与执行端", "OC 与 Reasonix 分卡、自检、监控（T15+ 实现）")
         self.logs_page = _LogsPage()
         self.settings_page = _SettingsPage()
@@ -350,6 +363,35 @@ class MainWindow(QMainWindow):
         root.addWidget(body, stretch=1)
 
         self._refresh_stop()
+
+    def _make_tasks_page(self) -> QWidget:
+        """PAGE02 接缝：注入 task_history_provider 时创建正式 TaskRecordsPage 并接
+        历史复制服务；否则保留 legacy Fake 页（T14 构造兼容）。MainWindow 自身
+        不创建 Database / TaskQueries / ClipboardSink，全部由上层注入。"""
+        if self._task_history_provider is None:
+            return _TasksPage(self._snapshot)
+        page = TaskRecordsPage(self._task_history_provider, self._snapshot)
+        page.copy_value_requested.connect(self._on_copy_value)
+        page.copy_result_requested.connect(self._on_copy_result)
+        return page
+
+    def _on_copy_value(self, kind: str, value: str) -> None:
+        service = self._history_copy
+        if service is None:
+            return
+        result = service.copy_value(kind=kind, value=value)
+        self.tasks_page.show_copy_feedback(
+            result.message, _COPY_TONES.get(result.outcome, "neutral")
+        )
+
+    def _on_copy_result(self, result_id: str) -> None:
+        service = self._history_copy
+        if service is None:
+            return
+        result = service.copy_result(result_id)
+        self.tasks_page.show_copy_feedback(
+            result.message, _COPY_TONES.get(result.outcome, "neutral")
+        )
 
     # ------------------------------------------------------------ 对外状态
 
@@ -496,7 +538,10 @@ class MainWindow(QMainWindow):
         else:  # narrow：导航切菜单，内容单列
             self.navbar.setVisible(False)
             self.menu_button.setVisible(True)
-        self.workbench_page.set_single_column(tier == TIER_NARROW)
+        single = tier == TIER_NARROW
+        self.workbench_page.set_single_column(single)
+        if isinstance(self.tasks_page, TaskRecordsPage):
+            self.tasks_page.set_single_column(single)
         self.navbar.select(self.current_page)
 
     def resizeEvent(self, event) -> None:

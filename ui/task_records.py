@@ -101,6 +101,15 @@ class TaskRecordsPage(QWidget):
         self._error_bar.hide()
         self._outer.addWidget(self._error_bar)
 
+        # ---- 复制反馈（B3：只展示，不碰剪贴板/Outbox；tone 走主题角色） ----
+        self._copy_feedback = QLabel()
+        self._copy_feedback.setWordWrap(True)
+        self._copy_feedback.setProperty("tone", "neutral")
+        self._copy_feedback.setAccessibleName("复制反馈")
+        refresh_style(self._copy_feedback)
+        self._copy_feedback.hide()
+        self._outer.addWidget(self._copy_feedback)
+
         self._split_row = QWidget()
         split = QHBoxLayout(self._split_row)
         split.setContentsMargins(0, 0, 0, 0)
@@ -177,6 +186,14 @@ class TaskRecordsPage(QWidget):
         self._load_list()
 
     # ------------------------------------------------------------- Provider seam
+
+    def show_copy_feedback(self, message: str, tone: str = "neutral") -> None:
+        """复制结果只读展示（success/missing/failed/unavailable → 主题 tone）。
+        本页不写剪贴板、不改 Outbox；写入由上层 HistoryCopyService 完成。"""
+        self._copy_feedback.setProperty("tone", tone)
+        refresh_style(self._copy_feedback)
+        self._copy_feedback.setText(message)
+        self._copy_feedback.show()
 
     def _with_error(
         self,
