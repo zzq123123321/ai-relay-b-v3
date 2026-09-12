@@ -448,6 +448,29 @@ def test_connection_short_label_keeps_stale_not_green():
     assert connection_short_label("接口暂不可达") == "连接 暂不可达"
 
 
+def test_structured_connection_never_falls_back_to_legacy_green():
+    """结构化 connection 存在时绝不回退旧 connection_healthy/connection_source。
+
+    即使 legacy connection_healthy=True，只要结构化结论不完整，就必须待核验，
+    不允许再次显示『模型/接口连接正常』绿灯。
+    """
+    conn = ConnectionSnapshot(
+        source="S1",
+        transport_ok=None,
+        payload_valid=None,
+        last_observed_at=T,
+        is_stale=False,
+    )
+    c = connection_presentation(_snap(conn_struct=conn, conn_healthy=True))
+    assert c.tone == "neutral"
+    assert c.tone != "success"
+    assert c.headline == "连接状态待核验"
+    assert c.headline != "模型/接口连接正常"
+    from ui.status_presenter import connection_short_label
+
+    assert connection_short_label(c.headline) == "连接 待核验"
+
+
 # ------------------------------------------------ T15R：运行时长 / 队列阻塞
 
 
@@ -476,6 +499,23 @@ def test_recovered_watching_cooldown_still_todo():
     steps = recovery_steps(s)
     assert [st.state for st in steps[:6]] == ["done"] * 6
     assert steps[6].state == "todo"
+    assert steps[6].label == "冷却"
+
+
+def test_cooldown_does_not_mark_recovered_execution_done():
+    """COOLDOWN（连续未确认新进展）：0..4 done、『已恢复执行』(5) todo、冷却 current。
+
+    冷却与“已恢复”语义互斥——绝不出现 ✓ 已恢复执行 + ● 冷却 的自相矛盾。
+    """
+    s = _snap(phase="COOLDOWN", interruption_id="i-7", last_real_progress_at=T)
+    steps = recovery_steps(s)
+    assert len(steps) == 7
+    assert [st.state for st in steps[:5]] == ["done"] * 5
+    assert steps[4].label == "已入会话待进展"
+    assert steps[5].state == "todo"
+    assert steps[5].label == "已恢复执行"
+    assert steps[6].state == "current"
+    assert steps[6].tone == "recovering"
     assert steps[6].label == "冷却"
 
 

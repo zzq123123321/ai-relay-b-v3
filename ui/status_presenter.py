@@ -223,6 +223,8 @@ def recovery_steps(snapshot: ApplicationSnapshot) -> tuple[RecoveryStepPresentat
 
     - 恢复中：当前阶段=current，之前=done，之后=todo；
     - 已恢复执行（WATCHING + interruption_id + 真实进展）：0..5 done，冷却仍 todo；
+    - COOLDOWN（连续未确认新进展）：0..4 done，『已恢复执行』(5) 仍 todo，
+      仅『冷却』(6) current——冷却与“已恢复”互斥，不伪造已恢复；
     - 普通 WATCHING（从未中断）：整条链全 todo（不冒充已恢复）；
     - PAUSED / BLOCKED：阶段条全量走 todo+neutral（分支状态不占节点）；
     - 无恢复上下文：全 todo（不冒充失败）。
@@ -259,6 +261,19 @@ def recovery_steps(snapshot: ApplicationSnapshot) -> tuple[RecoveryStepPresentat
                 state, tone = "done", "success"
             else:
                 state, tone = "todo", "neutral"
+            steps.append(RecoveryStepPresentation(label=label, state=state, tone=tone))
+        return tuple(steps)
+    if phase == "COOLDOWN":
+        # 冷却=连续未确认新进展：『已恢复执行』(5) 不得标成已完成，仅『冷却』(6) current。
+        # 冷却与“已恢复”语义互斥：不能同时显示 ✓ 已恢复执行 + ● 冷却。
+        steps: list[RecoveryStepPresentation] = []
+        for i, label in enumerate(RECOVERY_STEP_LABELS):
+            if i < 5:
+                state, tone = "done", "success"
+            elif i == 5:
+                state, tone = "todo", "neutral"
+            else:
+                state, tone = "current", "recovering"
             steps.append(RecoveryStepPresentation(label=label, state=state, tone=tone))
         return tuple(steps)
 
@@ -481,8 +496,10 @@ def connection_presentation(
 ) -> ConnectionPresentation:
     """模型/接口连接卡：来源 + 最后检测时间。
 
-    T15 结构化 connection 优先；connection 缺失时回退 T14
-    connection_healthy / connection_source。is_stale 为权威展示结论，
+    T15 结构化 connection 优先，存在即返回；仅有当 connection 为 None 时才允许
+    回退 T14 connection_healthy / connection_source。结构化存在但结论不完整
+    （如 transport_ok / payload_valid 缺失且时间不足以判定过期）时返回
+    『连接状态待核验』neutral，绝不继续读旧 green flag。is_stale 为权威展示结论，
     过期时显示『状态可能已过期』并降到 recovering，绝不含糊为绿灯。
     """
     conn = snapshot.connection
@@ -533,6 +550,13 @@ def connection_presentation(
                 "尚未收到接口检测结果",
                 "neutral",
             )
+        # 结构化存在但结论不完整（transport_ok/payload_valid 缺失、时间可以判断等）：
+        # 必须在此返回，绝不允许掉回旧 connection_healthy / connection_source。
+        return ConnectionPresentation(
+            "连接状态待核验",
+            f"{observed} · {source}",
+            "neutral",
+        )
 
     if snapshot.connection_source is not None:
         if snapshot.connection_healthy:
@@ -561,6 +585,7 @@ _SHORT_CONN_LABELS: dict[str, str] = {
     "接口可达，业务状态待核验": "连接 待核验",
     "业务数据校验未通过": "连接 数据异常",
     "连接状态未知": "连接 未知",
+    "连接状态待核验": "连接 待核验",
 }
 
 

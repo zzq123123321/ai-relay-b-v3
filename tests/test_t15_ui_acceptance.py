@@ -155,6 +155,25 @@ def test_t15r_header_follows_transport_down_and_payload_pending(qapp):
     w2.close()
 
 
+def test_t15r2_structured_unknown_never_falls_back_to_legacy_green(qapp):
+    """真实主窗：结构化存在但结论不完整 + legacy healthy=True → Header/工作台仍待核验。"""
+    from app.snapshots import ConnectionSnapshot
+
+    snap = fake_snapshot(connection_healthy=True).replace_snapshot(
+        connection=ConnectionSnapshot(
+            source="S1", transport_ok=None, payload_valid=None,
+            last_observed_at=T, is_stale=False,
+        ),
+    )
+    win = _make(snap)
+    wb = win.workbench_page
+    assert win._conn_badge.property("tone") == "neutral"     # noqa: SLF001 非绿灯
+    assert "连接 待核验" in win._conn_badge.text()            # noqa: SLF001
+    assert wb._conn_badge.property("tone") == "neutral"        # noqa: SLF001
+    assert "待核验" in wb._conn_badge.text()
+    win.close()
+
+
 # ---------------------------------------------------------------- UI-B01
 
 
@@ -287,6 +306,39 @@ def test_empty_to_new_task_is_allowed(qapp):
     first = _snap(task_id="task-A", sequence=1)
     win.update_snapshot(first)
     assert win.snapshot.active_task.task_id == "task-A"
+
+
+def test_t15r2_missing_sequence_late_callback_is_rejected(qapp):
+    """current 已入权威 sequence 世界（seq20），无 sequence 的旧回调不得倒灌覆盖。"""
+    win = _make(_snap(task_id="task-B", sequence=20, attempt_id="B", epoch=2))
+    assert win.snapshot.active_task.task_id == "task-B"
+
+    late = _snap(task_id="task-A", sequence=None, attempt_id="A", epoch=1)
+    win.update_snapshot(late)
+    QApplication.processEvents()
+    assert win.snapshot.active_task.task_id == "task-B"
+    assert "task-B" in win.workbench_page._task_id.text()  # noqa: SLF001
+    assert "task-B" in win.stop_button.toolTip()
+
+
+def test_t15r2_legacy_both_sequence_none_still_accepted(qapp):
+    """T14 legacy：双方都无 sequence（task123→task999）按旧契约直接接受。"""
+    win = _make(_snap(task_id="task123", sequence=None, attempt_id="a", epoch=1))
+    assert win.snapshot.active_task.task_id == "task123"
+    legacy = _snap(task_id="task999", sequence=None, attempt_id="b", epoch=2)
+    win.update_snapshot(legacy)
+    QApplication.processEvents()
+    assert win.snapshot.active_task.task_id == "task999"
+
+
+def test_t15r2_sequence_upgrade_from_legacy_is_accepted(qapp):
+    """current 无 sequence（legacy），正式快照 seq20 允许升级当前态。"""
+    win = _make(_snap(task_id="task-L", sequence=None, attempt_id="L", epoch=1))
+    assert win.snapshot.active_task.task_id == "task-L"
+    formal = _snap(task_id="task-N", sequence=20, attempt_id="N", epoch=1)
+    win.update_snapshot(formal)
+    QApplication.processEvents()
+    assert win.snapshot.active_task.task_id == "task-N"
 
 
 def test_completed_then_newer_task_boundary(qapp):

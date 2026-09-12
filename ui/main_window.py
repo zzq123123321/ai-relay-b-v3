@@ -423,17 +423,23 @@ class MainWindow(QMainWindow):
         self._refresh_stop()
 
     def _clearly_superseded(self, candidate: ApplicationSnapshot) -> bool:
-        """Snapshot 级 gate：仅在双方都有权威 sequence 时判定过期。
+        """Snapshot 级 gate：是否判定 candidate 过期而不予接受。
 
-        legacy（无 sequence）快照沿用 T14 更新契约直接接受，避免破坏
-        旧调用；身份算法本身全部复用 presenter.is_superseded_update。
+        非对称兼容规则（守住权威 sequence 世界，同时保持 T14 legacy 契约）：
+        - current 无任务 / candidate 无任务 → 接受（空态合同）；
+        - current.sequence 为 None → 接受：legacy 双无可迁移，新正式快照可升级 legacy；
+        - current.sequence 不为 None 但 candidate.sequence 为 None → 拒绝：
+          当前已进入权威 sequence 世界，不允许身份不完整的旧 callback 倒灌；
+        - 双方都有 sequence → 复用 presenter.is_superseded_update。
         """
         cand = candidate.active_task
         curr = self._snapshot.active_task
         if cand is None or curr is None:
             return False
-        if cand.sequence is None or curr.sequence is None:
+        if curr.sequence is None:
             return False
+        if cand.sequence is None:
+            return True
         return is_superseded_update(candidate, self._snapshot)
 
     def _refresh_header(self, snapshot: ApplicationSnapshot) -> None:
