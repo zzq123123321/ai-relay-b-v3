@@ -338,3 +338,35 @@ def candidate_result_is_stale(
     if pending.region != result.region:
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# T18-B1：确认框 Fake UI Command 纯合同（不含持久化/执行器/网络/DB）。
+# ---------------------------------------------------------------------------
+
+
+class UiCommandKind(str, Enum):
+    """确认框对应的用户动作种类：只声明意图，不执行任何业务。"""
+
+    MANUAL_WRAP = "manual_wrap"
+    STOP_TASK = "stop_task"
+    NEW_SESSION_RETRY = "new_session_retry"
+    DIAGNOSTIC_EXPORT = "diagnostic_export"
+
+
+@dataclass(frozen=True, slots=True)
+class UiCommandRequest:
+    """一次 UI 确认后的纯命令请求（Fake 合同，非持久化 Operation）。
+
+    - kind      = 用户确认了什么动作；
+    - target_id = 当前明确目标；没有就 None；
+    - context   = 只放 UI 所需的脱敏、不可变上下文（(key, value) 二元组序列）。
+
+    禁止在本层加入 operation_id/command_id 的持久语义、authority state machine、
+    retry/delivery state、DB commit、executor/client：这些属于后续真实命令层
+    （主规格 15.2 命令表所涉后端与 G3/G4）。
+    """
+
+    kind: UiCommandKind
+    target_id: str | None = None
+    context: tuple[tuple[str, str], ...] = ()
