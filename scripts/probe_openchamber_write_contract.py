@@ -2,6 +2,9 @@
 
 本脚本只做【只读】探测，绝不调用任何可能改变会话状态的写式方法：
 - 全部请求一律 GET；代码中不存在 POST/PUT/PATCH/DELETE 调用。
+- GET-only 是结构性的（by construction）：RouteProbe 不携带 method 字段，
+  probe_route 内部把 HTTP 动词硬编码为 "GET"，调用方无任何入口可指定方法；
+  通用 ProbeTransport 只以私有名 _ProbeTransport 进入本模块公共 namespace。
 - 会话 ID 使用合成占位（sess_000... _000...，必不存在的格式），仅用于验证
   路由接线（route wiring），不会创建、写入或影响任何真实会话。
 - GET 访问 /prompt /prompt_async /compact /wait /interrupt /message 这类路由
@@ -33,8 +36,8 @@ try:
         DEFAULT_BASE_URL,
         DEFAULT_TIMEOUT_SECONDS,
         MAX_BODY_BYTES,
-        ProbeTransport,
-        ProbeTransportError,
+        ProbeTransport as _ProbeTransport,
+        ProbeTransportError as _ProbeTransportError,
         default_settings_path,
         is_loopback_base_url,
         redact_json,
@@ -47,8 +50,8 @@ except ImportError:  # pragma: no cover - 允许脚本独立以 ``python -m scri
         DEFAULT_BASE_URL,
         DEFAULT_TIMEOUT_SECONDS,
         MAX_BODY_BYTES,
-        ProbeTransport,
-        ProbeTransportError,
+        ProbeTransport as _ProbeTransport,
+        ProbeTransportError as _ProbeTransportError,
         default_settings_path,
         is_loopback_base_url,
         redact_json,
@@ -92,7 +95,6 @@ def sanitize_sample(value: Any) -> Any:
 @dataclass(frozen=True, slots=True)
 class RouteProbe:
     name: str
-    method: str
     path: str
     attach_auth: bool = True
     note: str = ""
@@ -103,38 +105,40 @@ def build_route_probes(session_id: str) -> list[RouteProbe]:
 
     全部为 GET：对以 POST 为主的写路由发起 GET 只会得到无副作用的 404/405/400，
     用于证明【路由是否接线】，绝不证明也不触发写操作。
+    RouteProbe 不携带 method：HTTP 动词由 probe_route 内部硬编码为 GET，调用方
+    没有任何入口可指定 method（by construction 只读）。
     """
     sid = urllib.parse.quote(session_id, safe="")
     return [
-        RouteProbe("health", "GET", "/health", attach_auth=False,
+        RouteProbe("health", "/health", attach_auth=False,
                    note="service reachability, no auth"),
-        RouteProbe("api_guard_unauthzed", "GET", "/api", attach_auth=False,
+        RouteProbe("api_guard_unauthzed", "/api", attach_auth=False,
                    note="auth guard: expect 401 without token"),
-        RouteProbe("session_list", "GET", "/api/session",
+        RouteProbe("session_list", "/api/session",
                    note="session list (read contract baseline)"),
-        RouteProbe("session_status", "GET", "/api/session/status",
+        RouteProbe("session_status", "/api/session/status",
                    note="session status map (read contract baseline)"),
-        RouteProbe("session_active", "GET", "/api/session/active",
+        RouteProbe("session_active", "/api/session/active",
                    note="active sessions (read contract)"),
-        RouteProbe("session_get", "GET", f"/api/session/{sid}",
+        RouteProbe("session_get", f"/api/session/{sid}",
                    note="route wiring for session.get"),
-        RouteProbe("session_messages", "GET", f"/api/session/{sid}/message",
+        RouteProbe("session_messages", f"/api/session/{sid}/message",
                    note="route wiring: classic messages GET"),
-        RouteProbe("session_message_one", "GET", f"/api/session/{sid}/message/{sid}",
+        RouteProbe("session_message_one", f"/api/session/{sid}/message/{sid}",
                    note="route wiring: single message GET"),
-        RouteProbe("session_prompt", "GET", f"/api/session/{sid}/prompt",
+        RouteProbe("session_prompt", f"/api/session/{sid}/prompt",
                    note="route wiring: v2 prompt (POST-only; GET must never mutate)"),
-        RouteProbe("session_prompt_async", "GET", f"/api/session/{sid}/prompt_async",
+        RouteProbe("session_prompt_async", f"/api/session/{sid}/prompt_async",
                    note="route wiring: classic prompt_async (POST-only)"),
-        RouteProbe("session_compact", "GET", f"/api/session/{sid}/compact",
+        RouteProbe("session_compact", f"/api/session/{sid}/compact",
                    note="route wiring: compact (POST-only)"),
-        RouteProbe("session_wait", "GET", f"/api/session/{sid}/wait",
+        RouteProbe("session_wait", f"/api/session/{sid}/wait",
                    note="route wiring: wait (POST-only)"),
-        RouteProbe("session_interrupt", "GET", f"/api/session/{sid}/interrupt",
+        RouteProbe("session_interrupt", f"/api/session/{sid}/interrupt",
                    note="route wiring: interrupt (POST-only)"),
-        RouteProbe("session_context", "GET", f"/api/session/{sid}/context",
+        RouteProbe("session_context", f"/api/session/{sid}/context",
                    note="route wiring: context GET"),
-        RouteProbe("session_history", "GET", f"/api/session/{sid}/history?limit=1",
+        RouteProbe("session_history", f"/api/session/{sid}/history?limit=1",
                    note="route wiring: history GET"),
     ]
 
@@ -184,11 +188,15 @@ def classify_route_wiring(status: int, content_type: str | None, text: str) -> d
     return entry
 
 
-def probe_route(transport: ProbeTransport, probe: RouteProbe) -> dict[str, Any]:
-    """执行单条只读路由探测并返回证据条目。"""
+def probe_route(transport: _ProbeTransport, probe: RouteProbe) -> dict[str, Any]:
+    """执行单条只读路由探测并返回证据条目。
+
+    HTTP 动词在此硬编码为 "GET"，不接受来自调用方或 RouteProbe 的方法参数；
+    对以 POST 为主的写路由，GET 只会得到无副作用的 404/405/400。
+    """
     entry: dict[str, Any] = {
         "name": probe.name,
-        "method": probe.method,
+        "method": "GET",
         "path": probe.path,
         "note": probe.note,
         "http_status": None,
@@ -198,8 +206,8 @@ def probe_route(transport: ProbeTransport, probe: RouteProbe) -> dict[str, Any]:
         "error_kind": None,
     }
     try:
-        raw = transport.request(probe.method, probe.path, attach_auth=probe.attach_auth)
-    except ProbeTransportError as exc:
+        raw = transport.request("GET", probe.path, attach_auth=probe.attach_auth)
+    except _ProbeTransportError as exc:
         entry["error_kind"] = exc.kind
         return entry
     entry["http_status"] = raw.status
@@ -305,7 +313,7 @@ def load_artifacts() -> dict[str, str]:
 
 
 def run_probe(base_url: str, token: str | None, timeout: float) -> dict[str, Any]:
-    transport = ProbeTransport(base_url, token=token, timeout=timeout)
+    transport = _ProbeTransport(base_url, token=token, timeout=timeout)
     probes = build_route_probes(SYNTHETIC_SESSION_ID)
     endpoints = [probe_route(transport, p) for p in probes]
 
@@ -370,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         settings_path=default_settings_path(),
         attach_allowed=loopback,
     )
-    transport = ProbeTransport(args.base_url, token=token, timeout=args.timeout)
+    transport = _ProbeTransport(args.base_url, token=token, timeout=args.timeout)
     evidence = run_probe(args.base_url, token, args.timeout)
     text = json.dumps(evidence, ensure_ascii=False, indent=2)
     if args.out:
