@@ -410,18 +410,18 @@ class MainWindow(QMainWindow):
             result.message, _COPY_TONES.get(result.outcome, "neutral")
         )
 
-    def _on_settings_save_requested(self, draft, base_revision) -> None:
+    def _on_settings_save_requested(self, draft, base_revision) -> bool:
         ctrl = self._settings_save_controller
         if ctrl is None or not callable(getattr(ctrl, "save", None)):
             self.settings_page.show_save_feedback(
                 "保存功能尚未接入；仍使用原配置",
                 "danger",
             )
-            return
+            return False
         result = ctrl.save(draft, base_revision=base_revision)
         if result.new_revision is None:
             self.settings_page.show_save_feedback(result.message, "danger")
-            return
+            return False
         committed = getattr(ctrl, "current", None)
         if (
             committed is None
@@ -431,9 +431,10 @@ class MainWindow(QMainWindow):
                 "设置已提交，但生效版本状态核验异常，请重新载入设置后核对",
                 "danger",
             )
-            return
+            return False
         self.settings_page.set_committed_snapshot(committed)
         self.settings_page.show_save_feedback(result.message, "success")
+        return True
 
     def _on_settings_candidate_refresh_requested(self, request) -> None:
         self.settings_candidate_refresh_requested.emit(request)
@@ -465,6 +466,10 @@ class MainWindow(QMainWindow):
         """页面切换：只改「当前页 + 导航选中态 + 焦点」，不改业务 Snapshot。"""
         if page_id not in self._page_index:
             raise ValueError(f"未知页面: {page_id!r}")
+        if page_id != self._current_page and not self._may_leave_current_page():
+            self._sync_navigation_state(self._current_page)
+            self._restore_focus(self.settings_page)
+            return
         old = self.page_stack.currentWidget()
         if old is not None:
             focus_widget = old.focusWidget()
@@ -474,10 +479,37 @@ class MainWindow(QMainWindow):
         self._current_page = page_id
         # 切页回到滚动区顶部：跨页滚动位置不残留（否则可能带出当前页全部内容）
         self.body_scroll.verticalScrollBar().setValue(0)
+        self._sync_navigation_state(page_id)
+        self._restore_focus(self.page_stack.currentWidget())
+
+    def _may_leave_current_page(self) -> bool:
+        """PAGE05 离页门禁：needs_save=True 且注入 decider 时才询问，否则放行。"""
+        if self._current_page != "PAGE05":
+            return True
+        page = self.settings_page
+        if not getattr(page, "needs_save", False):
+            return True
+        decider = self._settings_leave_decider
+        if decider is None or not callable(decider):
+            return True
+        decision = str(decider()).strip().lower()
+        if decision == "save":
+            return bool(
+                self._on_settings_save_requested(
+                    page.build_draft(),
+                    getattr(page, "base_revision", None),
+                )
+            )
+        if decision == "discard":
+            self.settings_page.discard_changes()
+            return True
+        return False  # stay / unknown / 其它：安全留在本页
+
+    def _sync_navigation_state(self, page_id: str) -> None:
+        """同步左导航 + 窄屏菜单选中态到指定页（正常切页与阻止切页回滚共用）。"""
         self.navbar.select(page_id)
         for action in self._nav_actions:
             action.setChecked(action.data() == page_id)
-        self._restore_focus(self.page_stack.currentWidget())
 
     def _restore_focus(self, page: QWidget) -> None:
         """焦点策略：恢复该页最近焦点；否则落到该页焦点目标；绝不出现 focusWidget()=None。"""
