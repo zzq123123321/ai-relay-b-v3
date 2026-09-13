@@ -106,17 +106,17 @@ class TestO01FixedSessionMissingFailClosed:
 class TestO01DispatchDoesNotCreateOrSendWithoutSession:
     """session_id=None → SESSION_UNRESOLVED，send_once 调用为 0，不偷偷建会话。"""
 
-    def test_prepare_session_unresolved_no_send(self):
+    def test_prepare_session_unresolved_no_send(self, tmp_path):
         from core.dispatch import (
             DispatchOutcome,
             DispatchProposal,
-            DispatchResult,
             DispatchService,
         )
+        from storage.database import Database
 
         class _CountTransport:
-            send_calls: int = 0
             snapshot_calls: int = 0
+            send_calls: int = 0
 
             def capture_pre_send_snapshot(self, **kw):
                 self.snapshot_calls += 1
@@ -139,14 +139,23 @@ class TestO01DispatchDoesNotCreateOrSendWithoutSession:
             prompt_body="test",
         )
         transport = _CountTransport()
-        # DispatchService.prepare() 需要 DB，但 session_id=None 路径在 check_authority_in 之前短路
-        # 直接检查 SESSION_UNRESOLVED 的短路逻辑
-        # 实际上 prepare 中 session_id 检查在 check_authority_in 之前
-        # 用最小 DB 方式不行，所以直接从代码逻辑断言：session_id=None → SESSION_UNRESOLVED
-        # 改为检查 DispatchProposal 构造行为：session_id=None 是合法的
         assert proposal.session_id is None
-        # DispatchOutcome.SESSION_UNRESOLVED 存在且语义正确
         assert DispatchOutcome.SESSION_UNRESOLVED.value == "session_unresolved"
+
+        db = Database(tmp_path / "t19-boundary.sqlite")
+        db.open()
+        try:
+            result = DispatchService(db).prepare(proposal, transport=transport)
+            ops_row = db.connection.execute(
+                "SELECT COUNT(*) FROM operations"
+            ).fetchone()
+        finally:
+            db.close()
+
+        assert result.outcome is DispatchOutcome.SESSION_UNRESOLVED
+        assert transport.snapshot_calls == 0
+        assert transport.send_calls == 0
+        assert ops_row[0] == 0
 
 
 class TestO04MessageCapabilityUnverified:
