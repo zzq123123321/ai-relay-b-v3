@@ -175,14 +175,14 @@ def test_focus_remembered_and_restored_per_page(qapp):
     win = _make()
     win.navigate("PAGE05")  # 设置页
     QApplication.processEvents()
-    win.settings_page.draft.setFocus(Qt.TabFocusReason)
+    win.settings_page.focus_target.setFocus(Qt.TabFocusReason)
     QApplication.processEvents()
-    assert QApplication.focusWidget() is win.settings_page.draft
+    assert QApplication.focusWidget() is win.settings_page.focus_target
     win.navigate("PAGE04")
     QApplication.processEvents()
     win.navigate("PAGE05")
     QApplication.processEvents()
-    assert QApplication.focusWidget() is win.settings_page.draft, "返回设置页应恢复最近焦点"
+    assert QApplication.focusWidget() is win.settings_page.focus_target, "返回设置页应恢复最近焦点"
     win.close()
 
 

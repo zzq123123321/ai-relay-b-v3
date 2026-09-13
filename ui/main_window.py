@@ -49,6 +49,7 @@ from .components import (
 )
 from .dashboard import Dashboard
 from .navigation import NavigationBar, PAGES, PAGE_IDS
+from .settings_page import SettingsPage
 from .status_presenter import (
     connection_presentation,
     connection_short_label,
@@ -350,7 +351,7 @@ class MainWindow(QMainWindow):
         self.tasks_page = self._make_tasks_page()
         self.sessions_page = _SimplePage("会话与执行端", "OC 与 Reasonix 分卡、自检、监控（T15+ 实现）")
         self.logs_page = _LogsPage()
-        self.settings_page = _SettingsPage()
+        self.settings_page = SettingsPage(snapshot=self._snapshot)
         for page in (
             self.workbench_page,
             self.tasks_page,
@@ -465,6 +466,7 @@ class MainWindow(QMainWindow):
         self._snapshot = snapshot
         self.workbench_page.render(snapshot)
         self.tasks_page.render(snapshot)
+        self.settings_page.render(snapshot)
         self._refresh_header(snapshot)
         self._refresh_stop()
 
@@ -546,6 +548,7 @@ class MainWindow(QMainWindow):
         self.workbench_page.set_single_column(single)
         if isinstance(self.tasks_page, TaskRecordsPage):
             self.tasks_page.set_single_column(single)
+        self.settings_page.set_single_column(single)
         self.navbar.select(self.current_page)
 
     def resizeEvent(self, event) -> None:
