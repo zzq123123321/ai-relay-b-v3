@@ -245,6 +245,7 @@ class MainWindow(QMainWindow):
     """主窗壳。T14 停止入口为 Fake：点击仅 emit stop_requested，不执行任何停止。"""
 
     stop_requested = Signal(str)  # 参数：当前页面 ID（审计用），不做业务停止
+    settings_candidate_refresh_requested = Signal(object)  # CandidateRequest（异步请求边界，外部接出）
 
     def __init__(
         self,
@@ -360,6 +361,9 @@ class MainWindow(QMainWindow):
         self.settings_page.save_requested.connect(
             self._on_settings_save_requested
         )
+        self.settings_page.candidate_refresh_requested.connect(
+            self._on_settings_candidate_refresh_requested
+        )
         for page in (
             self.workbench_page,
             self.tasks_page,
@@ -430,6 +434,12 @@ class MainWindow(QMainWindow):
             return
         self.settings_page.set_committed_snapshot(committed)
         self.settings_page.show_save_feedback(result.message, "success")
+
+    def _on_settings_candidate_refresh_requested(self, request) -> None:
+        self.settings_candidate_refresh_requested.emit(request)
+
+    def apply_settings_candidate_result(self, result) -> bool:
+        return self.settings_page.apply_candidate_result(result)
 
     # ------------------------------------------------------------ 对外状态
 
