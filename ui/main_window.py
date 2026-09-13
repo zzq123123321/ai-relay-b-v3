@@ -253,6 +253,8 @@ class MainWindow(QMainWindow):
         *,
         task_history_provider=None,
         history_copy_service=None,
+        settings_save_controller=None,
+        settings_leave_decider=None,
     ) -> None:
         super().__init__(parent)
         self._snapshot = snapshot or empty_snapshot()
@@ -263,6 +265,8 @@ class MainWindow(QMainWindow):
         self._widget_page: dict[QWidget, str] = {}
         self._task_history_provider = task_history_provider
         self._history_copy = history_copy_service
+        self._settings_save_controller = settings_save_controller
+        self._settings_leave_decider = settings_leave_decider
 
         self._build()
         self._refresh_header(self._snapshot)
