@@ -351,7 +351,15 @@ class MainWindow(QMainWindow):
         self.tasks_page = self._make_tasks_page()
         self.sessions_page = _SimplePage("会话与执行端", "OC 与 Reasonix 分卡、自检、监控（T15+ 实现）")
         self.logs_page = _LogsPage()
-        self.settings_page = SettingsPage(snapshot=self._snapshot)
+        ctrl = self._settings_save_controller
+        committed = getattr(ctrl, "current", None) if ctrl is not None else None
+        self.settings_page = SettingsPage(
+            committed_snapshot=committed,
+            snapshot=self._snapshot,
+        )
+        self.settings_page.save_requested.connect(
+            self._on_settings_save_requested
+        )
         for page in (
             self.workbench_page,
             self.tasks_page,
@@ -397,6 +405,31 @@ class MainWindow(QMainWindow):
         self.tasks_page.show_copy_feedback(
             result.message, _COPY_TONES.get(result.outcome, "neutral")
         )
+
+    def _on_settings_save_requested(self, draft, base_revision) -> None:
+        ctrl = self._settings_save_controller
+        if ctrl is None or not callable(getattr(ctrl, "save", None)):
+            self.settings_page.show_save_feedback(
+                "保存功能尚未接入；仍使用原配置",
+                "danger",
+            )
+            return
+        result = ctrl.save(draft, base_revision=base_revision)
+        if result.new_revision is None:
+            self.settings_page.show_save_feedback(result.message, "danger")
+            return
+        committed = getattr(ctrl, "current", None)
+        if (
+            committed is None
+            or getattr(committed, "revision", None) != result.new_revision
+        ):
+            self.settings_page.show_save_feedback(
+                "设置已提交，但生效版本状态核验异常，请重新载入设置后核对",
+                "danger",
+            )
+            return
+        self.settings_page.set_committed_snapshot(committed)
+        self.settings_page.show_save_feedback(result.message, "success")
 
     # ------------------------------------------------------------ 对外状态
 

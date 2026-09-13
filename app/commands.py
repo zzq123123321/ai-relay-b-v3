@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
-from core.domain import ReceiveSettingsSnapshot
+from core.domain import ReceiveSettingsSnapshot, SettingsDraft, SettingsSnapshot
 from core.ingress import IngressError, IngressErrorCode, IngressService
 from core.protocol_v1 import LEGACY_BEGIN, PROTOCOL_MARKER
 from core.settings_service import (
@@ -234,6 +234,43 @@ def map_settings_save_error(exc: Exception, *, base_revision: int | None) -> Set
         message=f"保存设置失败：{exc}；仍使用原配置",
         base_revision=base_revision,
     )
+
+
+class SettingsSaveController:
+    """T17-B3：真实设置保存控制器（接 SettingsService，供 MainWindow 注入）。
+
+    - 唯一保存路径：``SettingsService.submit_draft(draft, base_revision=..., actor="user")``；
+    - validation/CAS 全部复用 B1 既存合同，不在此实现第二套校验；
+    - 成功后才返回 SAVED；``current`` 即 ``SettingsService.current``，不维护第二份缓存。
+    """
+
+    def __init__(self, settings: SettingsService) -> None:
+        self._settings = settings
+
+    @property
+    def current(self) -> SettingsSnapshot | None:
+        """当前唯一生效快照（从未提交过时为 None）。"""
+        return self._settings.current
+
+    def save(
+        self,
+        draft: SettingsDraft,
+        *,
+        base_revision: int | None,
+    ) -> SettingsSaveResult:
+        try:
+            snapshot = self._settings.submit_draft(
+                draft,
+                base_revision=base_revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一映射为类型化结果（B1 合同）
+            return map_settings_save_error(exc, base_revision=base_revision)
+        return SettingsSaveResult(
+            kind=SettingsSaveOutcomeKind.SAVED,
+            message=f"设置已保存，当前生效配置 rev {snapshot.revision}",
+            base_revision=base_revision,
+            new_revision=snapshot.revision,
+        )
 
 
 class CandidateKind(str, Enum):
