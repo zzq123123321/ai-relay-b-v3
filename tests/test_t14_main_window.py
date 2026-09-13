@@ -3,8 +3,8 @@
 验收依据：
 - UI-A01 首次打开工作台：主任务、接收、自动续接、连接分区清楚；无任务时空状态。
 - UI-A05/UI-A06（壳层部分）在此文件断言结构与固定停止，窄屏/滚动在 test_t14_responsive。
-- 固定顶部停止入口：在 headerBar，不在滚动内容区内，Fake 点击仅 emit stop_requested；
-  点击不改变活动任务/快照/UI 状态（本阶段不真正停止任务）。
+- 固定顶部停止入口：在 headerBar，不在滚动内容区内，T18 后点击打开 DLG02；
+  Confirm 后才对外发 Fake Command（ui_command_requested）与 legacy stop_requested。
 - L06 主题复用 T13：集中 token+QSS，无第二套样式、无组件级 setStyleSheet、无硬编码色值。
 """
 
@@ -117,14 +117,31 @@ def test_ui_a01_receiving_connection_partitions(qapp):
 
 
 def test_stop_click_emits_request_and_never_mutates_business(qapp):
-    """Fake 停止：只 emit stop_requested，不修改快照/活动任务/UI 状态（本阶段不真正停止）。"""
+    """Fake 停止（T18）：点击打开 DLG02，confirm 恰一次发命令，不修改业务状态。"""
     snap = fake_snapshot(task_id="task-123", state="ACTIVE", stop_available=True)
     win = _make(snap)
-    emitted = []
-    win.stop_requested.connect(emitted.append)
+    commands = []
+    win.ui_command_requested.connect(commands.append)
     win.stop_button.click()
     QApplication.processEvents()
-    assert emitted == ["PAGE01"]
+    # 点击本身：不发命令
+    assert commands == []
+    dialog = win._stop_dialog  # noqa: SLF001
+    assert dialog is not None and dialog.isVisible()
+    # cancel → 0 command
+    dialog.reject()
+    QApplication.processEvents()
+    assert commands == []
+    assert win._stop_dialog is None  # noqa: SLF001 finished 后清引用
+    # confirm → 恰 1
+    win.stop_button.click()
+    QApplication.processEvents()
+    dialog = win._stop_dialog  # noqa: SLF001
+    dialog._confirm_button.click()  # noqa: SLF001
+    QApplication.processEvents()
+    assert len(commands) == 1
+    assert commands[0].kind.value == "stop_task"
+    assert commands[0].target_id == "task-123"
     assert win.snapshot.active_task.task_id == "task-123"
     assert win.snapshot.active_task.state == "ACTIVE"
     assert win.workbench_page._state_badge.text() == "✓ ACTIVE"  # noqa: SLF001 不改为 STOPPED
@@ -134,20 +151,22 @@ def test_stop_click_emits_request_and_never_mutates_business(qapp):
 
 
 def test_stop_click_each_page_no_business_change(qapp):
-    """在每一页点击停止都不改变活动任务与快照身份。"""
+    """在每一页点击停止都不发命令、不改变活动任务与快照身份（只开确认框）。"""
     snap = fake_snapshot(task_id="task-123")
     win = _make(snap)
     snap_id = id(win.snapshot)
-    emitted = []
-    win.stop_requested.connect(emitted.append)
+    commands = []
+    win.ui_command_requested.connect(commands.append)
     for pid in PAGE_IDS:
         win.navigate(pid)
         QApplication.processEvents()
         win.stop_button.click()
         QApplication.processEvents()
-        assert emitted[-1] == pid
+        assert commands == []
         assert id(win.snapshot) == snap_id
         assert win.snapshot.active_task.task_id == "task-123"
+        win._stop_dialog.reject()  # noqa: SLF001 清理确认框
+        QApplication.processEvents()
     win.close()
 
 

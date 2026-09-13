@@ -55,6 +55,7 @@ class TaskRecordsPage(QWidget):
 
     copy_value_requested = Signal(str, str)
     copy_result_requested = Signal(str)
+    ui_command_requested = Signal(object)  # T18：原对象上浮，不解释不修改
 
     def __init__(self, provider, snapshot: ApplicationSnapshot | None = None) -> None:
         super().__init__()
@@ -173,6 +174,7 @@ class TaskRecordsPage(QWidget):
         self.detail_panel = TaskDetailPanel()
         self.detail_panel.copy_value_requested.connect(self.copy_value_requested)
         self.detail_panel.copy_result_requested.connect(self.copy_result_requested)
+        self.detail_panel.ui_command_requested.connect(self._forward_command)
         self.detail_panel.result_selected.connect(self.select_result)
         split.addWidget(self.detail_panel)
         split.setStretch(1, 4)
@@ -186,6 +188,10 @@ class TaskRecordsPage(QWidget):
         self._load_list()
 
     # ------------------------------------------------------------- Provider seam
+
+    def _forward_command(self, request) -> None:
+        """原对象上浮，不解释 Command、不修改 request、不访问 DB 写接口。"""
+        self.ui_command_requested.emit(request)
 
     def show_copy_feedback(self, message: str, tone: str = "neutral") -> None:
         """复制结果只读展示（success/missing/failed/unavailable → 主题 tone）。

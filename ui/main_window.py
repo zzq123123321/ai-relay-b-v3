@@ -7,7 +7,7 @@
      │    ├─ 应用标题
      │    ├─ 窄屏导航菜单入口（可切菜单）
      │    ├─ 接收 / 连接 状态
-     │    └─ 固定顶部停止入口（红描边，Fake：仅 emit stop_requested）
+     │    └─ 固定顶部停止入口（红描边，T18：点击开 DLG02 确认，Confirm 后发 Fake Command）
      └─ body
           ├─ 左导航 NavigationBar（wide：206 图文；medium：72 图标栏；narrow：隐藏改菜单）
           └─ QScrollArea（内容区，只纵向滚动，禁止整页横向滚动）
@@ -48,6 +48,7 @@ from .components import (
     TextInput,
 )
 from .dashboard import Dashboard
+from .dialogs import StopTaskDialog
 from .navigation import NavigationBar, PAGES, PAGE_IDS
 from .settings_page import SettingsPage
 from .status_presenter import (
@@ -242,9 +243,11 @@ class _SettingsPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """主窗壳。T14 停止入口为 Fake：点击仅 emit stop_requested，不执行任何停止。"""
+    """主窗壳。T14/T18 停止入口：点击打开确认框（DLG02），Confirm 后才对外发
+    Fake UiCommandRequest（ui_command_requested）与 legacy stop_requested 通知。"""
 
-    stop_requested = Signal(str)  # 参数：当前页面 ID（审计用），不做业务停止
+    stop_requested = Signal(str)  # 参数：当前页面 ID（审计用），仅作为已确认停止意图的 legacy 通知
+    ui_command_requested = Signal(object)  # T18：Fake UiCommandRequest outward seam
     settings_candidate_refresh_requested = Signal(object)  # CandidateRequest（异步请求边界，外部接出）
 
     def __init__(
@@ -328,6 +331,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setAccessibleName("停止当前任务")
         self.stop_button.clicked.connect(self._on_stop_clicked)
         header_lay.addWidget(self.stop_button)
+        self._stop_dialog = None  # T18：同时最多一个 DLG02，finished 后清引用
 
         root.addWidget(header)
 
@@ -390,7 +394,12 @@ class MainWindow(QMainWindow):
         page = TaskRecordsPage(self._task_history_provider, self._snapshot)
         page.copy_value_requested.connect(self._on_copy_value)
         page.copy_result_requested.connect(self._on_copy_result)
+        page.ui_command_requested.connect(self._on_tasks_command_requested)
         return page
+
+    def _on_tasks_command_requested(self, request) -> None:
+        """PAGE02 上浮：转发同一个 request 对象，不重建 kind/context。"""
+        self.ui_command_requested.emit(request)
 
     def _on_copy_value(self, kind: str, value: str) -> None:
         service = self._history_copy
@@ -585,10 +594,56 @@ class MainWindow(QMainWindow):
             self.stop_button.set_disabled_reason("当前没有可停止的活动任务")
 
     def _on_stop_clicked(self) -> None:
-        """Fake 停止：仅广播请求，绝不修改任务/快照/UI 状态。真正命令接线在后续任务。"""
+        """T18：点击 stop 只打开 DLG02 确认框，不对外发命令。
+
+        UI-A10：点击本身不 emit UiCommandRequest / 不 emit stop_requested /
+        不改变 snapshot / 不改变 task state。只有 DLG02 Confirm 后才算提交。
+        身份在打开 Dialog 时冻结（active_task 当前字段），后续 snapshot 改变
+        不得回写 Dialog.request。
+        """
         if not self._snapshot.stop_available:
             return
+        if self._stop_dialog is not None and self._stop_dialog.isVisible():
+            self._stop_dialog.raise_()
+            self._stop_dialog.activateWindow()
+            return
+        active = self._snapshot.active_task
+        target_id = active.task_id if active is not None else None
+        dialog = StopTaskDialog(
+            self,
+            target_id=target_id,
+            context=self._stop_context(),
+            return_focus_widget=self.stop_button,
+            target_title=(active.title or active.task_id) if active is not None else "",
+        )
+        self._stop_dialog = dialog
+        dialog.command_requested.connect(self._on_stop_command)
+        dialog.finished.connect(self._on_stop_dialog_finished)
+        dialog.open()
+
+    def _stop_context(self) -> tuple[tuple[str, str], ...]:
+        """打开 Dialog 瞬间冻结身份：只保存存在的字段，值转字符串，不伪造。"""
+        active = self._snapshot.active_task
+        parts = []
+        if active is not None:
+            if active.task_id:
+                parts.append(("task_id", active.task_id))
+            if active.authority_epoch is not None:
+                parts.append(("authority_epoch", str(active.authority_epoch)))
+            if active.attempt_id:
+                parts.append(("attempt_id", active.attempt_id))
+            if active.sequence is not None:
+                parts.append(("sequence", str(active.sequence)))
+        parts.append(("page_id", self.current_page))
+        return tuple(parts)
+
+    def _on_stop_command(self, request) -> None:
+        """DLG02 Confirm 恰一次：ui_command_requested + legacy stop_requested 各 1。"""
+        self.ui_command_requested.emit(request)
         self.stop_requested.emit(self.current_page)
+
+    def _on_stop_dialog_finished(self, _result: int) -> None:
+        self._stop_dialog = None
 
     def keyPressEvent(self, event) -> None:
         """键盘导航：焦点在导航项时按 Enter/Return 激活该项（Tab/Shift+Tab 由 QPushButton 原生支持）。"""

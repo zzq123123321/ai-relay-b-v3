@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.components import Card, SecondaryButton, TextButton
+from ui.dialogs import ManualWrapDialog, NewSessionRetryDialog
 from ui.theme_tokens import refresh_style
 
 
@@ -71,17 +72,20 @@ def _copy_row(kind: str, title: str, value: str) -> tuple[QWidget, QLabel, TextB
 
 
 class TaskDetailPanel(QWidget):
-    """PANEL01 任务详情。数据全部由外部 render_* 注入；自身只发复制/选择信号。"""
+    """PANEL01 任务详情。数据全部由外部 render_* 注入；自身只发复制/选择/命令信号。"""
 
     copy_value_requested = Signal(str, str)
     copy_result_requested = Signal(str)
     result_selected = Signal(str)
+    ui_command_requested = Signal(object)  # T18：确认框 Fake UiCommandRequest（对外接出）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._active_attempt_id: str | None = None
         self._selected_result_id: str | None = None
         self._result_readable = False
+        self._active_detail = None  # 最近 render_detail 注入的 TaskDetail（冻结身份来源）
+        self._command_dialog = None  # 同一时刻最多一个命令 Dialog
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -255,6 +259,30 @@ class TaskDetailPanel(QWidget):
         self.result_card.add(self._result_meta)
         self.result_card.add(self.copy_reply_button)
         outer.addWidget(self.result_card)
+
+        # ------------------------------------------------------------- 高级操作（T18）
+        # UI-A13：不放在搜索/翻页/复制高频区；明确提示会改变执行路径。
+        self.advanced_card = Card("高级操作")
+        advanced_note = QLabel("高级操作会改变执行路径，请确认影响后再继续。")
+        advanced_note.setWordWrap(True)
+        advanced_note.setAccessibleName("高级操作影响提示")
+        advanced_note.setObjectName("advanced_op_warning")
+        self.advanced_card.add(advanced_note)
+        advanced_row = QHBoxLayout()
+        advanced_row.setContentsMargins(0, 0, 0, 0)
+        advanced_row.setSpacing(8)
+        self.manual_wrap_button = SecondaryButton("人工包装…")
+        self.manual_wrap_button.setAccessibleName("人工包装")
+        self.manual_wrap_button.clicked.connect(self._open_manual_wrap_dialog)
+        self.new_session_button = SecondaryButton("新会话重试…")
+        self.new_session_button.setAccessibleName("新会话重试")
+        self.new_session_button.clicked.connect(self._open_new_session_dialog)
+        advanced_row.addWidget(self.manual_wrap_button)
+        advanced_row.addWidget(self.new_session_button)
+        advanced_row.addStretch(1)
+        self.advanced_card.add_layout(advanced_row)
+        outer.addWidget(self.advanced_card)
+
         outer.addStretch(1)
 
         self.clear()
@@ -350,6 +378,10 @@ class TaskDetailPanel(QWidget):
         self.copy_reply_button.setEnabled(False)
         self.copy_sha_button.setEnabled(False)
         self.copy_result_id_button.setEnabled(False)
+        # T18：无详情时命令动作必须不可用
+        self._active_detail = None
+        self.manual_wrap_button.setEnabled(False)
+        self.new_session_button.setEnabled(False)
 
     def _clear_attempts(self) -> None:
         while self._attempt_box.count():
@@ -369,6 +401,10 @@ class TaskDetailPanel(QWidget):
             self._identity_note.show()
             return
         self._identity_note.hide()
+        # T18：有效详情时激活命令动作，身份以打开瞬间的最新详情为准
+        self._active_detail = detail
+        self.manual_wrap_button.setEnabled(True)
+        self.new_session_button.setEnabled(True)
         self.task_id_value.setText(_label_value(detail.task_id))
         self.task_id_value.setToolTip(_label_value(detail.task_id))
         self.task_key_value.setText(detail.task_key)
@@ -540,3 +576,76 @@ class TaskDetailPanel(QWidget):
     def _on_copy_reply(self) -> None:
         if self._result_readable and self._selected_result_id:
             self.copy_result_requested.emit(self._selected_result_id)
+
+    # ------------------------------------------------------------- T18 命令动作
+
+    def _context_identity(self, detail) -> tuple[tuple[str, str], ...]:
+        """打开 Dialog 瞬间冻结身份：只保存存在的字段，值转字符串，不伪造。"""
+        parts = []
+        if detail.task_key:
+            parts.append(("task_key", detail.task_key))
+        if detail.authority_epoch is not None:
+            parts.append(("authority_epoch", str(detail.authority_epoch)))
+        if detail.active_attempt_id:
+            parts.append(("active_attempt_id", detail.active_attempt_id))
+        if detail.frozen_session_id:
+            parts.append(("frozen_session_id", detail.frozen_session_id))
+        return tuple(parts)
+
+    def _target_id(self, detail) -> str | None:
+        return detail.task_id or detail.task_key or None
+
+    def _body_preview(self, body: str) -> str:
+        body = body or ""
+        return body[:160] + "…" if len(body) > 160 else body
+
+    def _open_command_dialog(self, factory) -> None:
+        """同一时刻最多一个命令 Dialog：已有可见 Dialog 时聚焦，不重复创建。"""
+        if self._command_dialog is not None and self._command_dialog.isVisible():
+            self._command_dialog.raise_()
+            self._command_dialog.activateWindow()
+            return
+        dialog = factory()
+        self._command_dialog = dialog
+        dialog.command_requested.connect(self._forward_command)
+        dialog.finished.connect(self._on_command_dialog_finished)
+        dialog.open()
+
+    def _on_command_dialog_finished(self, _result: int) -> None:
+        self._command_dialog = None
+
+    def _forward_command(self, request) -> None:
+        """原对象上浮，不解释、不重建。"""
+        self.ui_command_requested.emit(request)
+
+    def _open_manual_wrap_dialog(self) -> None:
+        detail = self._active_detail
+        if detail is None:
+            return
+
+        def factory():
+            return ManualWrapDialog(
+                self,
+                target_id=self._target_id(detail),
+                context=self._context_identity(detail),
+                return_focus_widget=self.manual_wrap_button,
+                target_title=_label_value(self._target_id(detail)),
+                body_preview=self._body_preview(detail.body),
+            )
+
+        self._open_command_dialog(factory)
+
+    def _open_new_session_dialog(self) -> None:
+        detail = self._active_detail
+        if detail is None:
+            return
+
+        def factory():
+            return NewSessionRetryDialog(
+                self,
+                target_id=self._target_id(detail),
+                context=self._context_identity(detail),
+                return_focus_widget=self.new_session_button,
+            )
+
+        self._open_command_dialog(factory)
