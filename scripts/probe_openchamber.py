@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import ipaddress
 import json
 import os
 import socket
@@ -79,15 +78,10 @@ _PAGINATION_KEYS = frozenset(
 
 
 def is_loopback_host(host: str | None) -> bool:
-    """host 是否为 loopback（localhost / 127.0.0.1 / ::1 / 127.x）。"""
+    """host 是否命中精确 loopback 白名单（localhost / 127.0.0.1 / ::1）。"""
     if not host:
         return False
-    if host.strip().lower().split(":")[0].lower() == "localhost":
-        return True
-    try:
-        return bool(ipaddress.ip_address(host.strip()).is_loopback)
-    except ValueError:
-        return False
+    return host.strip().lower() in LOOPBACK_HOSTS
 
 
 def is_loopback_base_url(base_url: str) -> bool:

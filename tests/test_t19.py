@@ -278,6 +278,37 @@ def test_non_loopback_never_attaches_desktop_token():
     assert all("Authorization" not in r["headers"] for r in opener.requests)
 
 
+def test_loopback_127_0_0_2_never_attaches_any_token():
+    settings = '{"desktopLocalClientToken":"SECRET-DESKTOP-2"}'
+    _, opener, transport = _run(
+        "http://127.0.0.2:57123", directory="d", routes=_ok_routes("d"),
+        env_token="SECRET-ENV-2", settings_text=settings,
+    )
+    assert transport.is_loopback is False
+    assert opener.requests
+    assert all("Authorization" not in r["headers"] for r in opener.requests)
+
+
+def test_loopback_127_1_2_3_never_attaches_any_token():
+    settings = '{"desktopLocalClientToken":"SECRET-DESKTOP-3"}'
+    _, opener, transport = _run(
+        "http://127.1.2.3:57123", directory="d", routes=_ok_routes("d"),
+        env_token="SECRET-ENV-3", settings_text=settings,
+    )
+    assert transport.is_loopback is False
+    assert opener.requests
+    assert all("Authorization" not in r["headers"] for r in opener.requests)
+
+
+def test_is_loopback_host_exact_whitelist():
+    assert probe.is_loopback_host("127.0.0.1") is True
+    assert probe.is_loopback_host("localhost") is True
+    assert probe.is_loopback_host("::1") is True
+    assert probe.is_loopback_host("127.0.0.2") is False
+    assert probe.is_loopback_host("127.1.2.3") is False
+    assert probe.is_loopback_host("LOCALHOST") is True
+
+
 def test_authorization_not_in_evidence():
     ev, _, _ = _run(
         "http://127.0.0.1:57123", directory="d", routes=_ok_routes("d"),
