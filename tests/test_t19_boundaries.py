@@ -17,7 +17,6 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 _CONTRACT_PATH = _REPO / "contracts" / "openchamber_contract.md"
-_ADAPTER_PATH = _REPO / "adapters" / "openchamber.py"
 
 
 def _contract() -> str:
@@ -283,11 +282,13 @@ class TestSevenLayersIndependent:
         assert "everything connected" not in contract.lower()
 
 
-class TestT20BoundaryNotReached:
-    """T20 adapter 不存在；B3 不跨边界。"""
+class TestT19IsolationFromT20Adapter:
+    """T20 adapter 允许存在/被 tracked，但 T19 不依赖、不导入。"""
 
-    def test_adapter_absent(self):
-        assert not _ADAPTER_PATH.exists(), f"adapters/openchamber.py 不应存在（T20 才实现）"
+    def test_t19_probe_does_not_import_t20_adapter(self):
+        probe = (_REPO / "scripts" / "probe_openchamber.py").read_text(encoding="utf-8")
+        assert "adapters.openchamber" not in probe
+        assert "from adapters import openchamber" not in probe
 
     def test_no_production_file_modified(self):
         for rel in (
@@ -335,7 +336,6 @@ class TestNoT20FeaturesLeakedIntoT19:
 
     def test_no_adapter_import_in_boundary_test(self):
         """本轮测试自身不得导入 adapter。"""
-        # 本文件顶部已声明 _ADAPTER_PATH 存在但不导入
         pass
 
     def test_domain_has_target_executor_openchamber(self):
