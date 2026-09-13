@@ -47,6 +47,18 @@ KIND_CREDENTIALS_IN_URL = "CREDENTIALS_IN_URL"
 KIND_TIMEOUT = "TIMEOUT"
 KIND_CONNECTION = "CONNECTION"
 
+# T20-02：Client 层稳定分类（transport 的 TIMEOUT/CONNECTION 原样上抛，不在此列表改写）
+KIND_AUTH = "AUTH"
+KIND_NOT_FOUND_OR_UNSUPPORTED = "NOT_FOUND_OR_UNSUPPORTED"
+KIND_HTTP_ERROR = "HTTP_ERROR"
+KIND_MALFORMED_JSON = "MALFORMED_JSON"
+KIND_UNEXPECTED_SHAPE = "UNEXPECTED_SHAPE"
+KIND_MISSING_INPUT = "MISSING_INPUT"
+
+# 分类型 missing semantics（[] 与 {} 各自独立，禁止合并为一个布尔 missing 标记）
+NO_SESSION_OBSERVED_IN_DIRECTORY = "NO_SESSION_OBSERVED_IN_DIRECTORY"
+NO_STATUS_ENTRY_OBSERVED_IN_DIRECTORY = "NO_STATUS_ENTRY_OBSERVED_IN_DIRECTORY"
+
 
 def is_loopback_host(host: str | None) -> bool:
     """host 是否命中精确 loopback 白名单（localhost / 127.0.0.1 / ::1，忽略大小写）。"""
@@ -233,4 +245,156 @@ class OpenChamberReadTransport:
         status = int(getattr(raw, "status", None) or raw.getcode() or 0)
         return OpenChamberRawResponse(
             status=status, content_type=_content_type_of(raw), body=body, truncated=truncated
+        )
+
+
+class OpenChamberApiError(OpenChamberReadError):
+    """Client 层结构化错误：kind 为稳定分类；status 为 HTTP 状态（输入错误为 None）；endpoint 为调用入口名。
+
+    异常正文只含分类与静态排查上下文，绝不携带完整 response body、token 或 Authorization。
+    """
+
+    def __init__(
+        self, kind: str, endpoint: str, status: int | None = None, detail: str = ""
+    ) -> None:
+        super().__init__(kind, detail)
+        self.status = status
+        self.endpoint = endpoint
+
+
+@dataclass(frozen=True, slots=True)
+class OpenChamberObservation:
+    """单次只读观察结果，不可变：
+
+    endpoint 明确 + HTTP status 保留 + parsed payload 原样保留 + missing semantics
+    分类型表达。[]（session list）/ {}（session status）分别用稳定字符串表达"本次
+    目录未观察到"，绝不合成布尔 missing 标记或全局断言。
+    """
+
+    endpoint: str
+    http_status: int
+    payload: object
+    missing_semantics: str | None = None
+
+
+def _require_directory(directory: str, endpoint: str) -> str:
+    """blank 目录输入错误：不发送任何 HTTP，直接抛稳定 client 输入错误。"""
+    if not isinstance(directory, str) or not directory.strip():
+        raise OpenChamberApiError(
+            KIND_MISSING_INPUT, endpoint, detail="directory 不能为空（不发送任何 HTTP）"
+        )
+    return directory
+
+
+def _raise_http_error(endpoint: str, resp: OpenChamberRawResponse) -> None:
+    if resp.status in (401, 403):
+        raise OpenChamberApiError(KIND_AUTH, endpoint, status=resp.status, detail="HTTP 认证失败")
+    if resp.status == 404:
+        raise OpenChamberApiError(
+            KIND_NOT_FOUND_OR_UNSUPPORTED, endpoint, status=resp.status, detail="接口不存在或未支持"
+        )
+    raise OpenChamberApiError(
+        KIND_HTTP_ERROR, endpoint, status=resp.status, detail="HTTP 非 2xx"
+    )
+
+
+class OpenChamberReadClient:
+    """OpenChamber 只读业务 Client（T20-02）。
+
+    HTTP 唯一 seam 是 T20-01 封板的 OpenChamberReadTransport（禁止再造第二套
+    HTTP client / urllib opener / requests）。四个只读 endpoint 观察，仅表达
+    endpoint-level observation，不做统一 connected/healthy/everything_ok 综合判定。
+    公开面无任何 send/message/approve 等写能力（message 仍为 T19 UNVERIFIED）。
+
+    endpoint 契约（与 contracts/openchamber_contract.md §3/§8 一致）：
+    - health()          GET /health（attach_auth=False）
+    - list_sessions(d)  GET /api/session?directory=...（attach_auth=True）
+    - session_status(d) GET /api/session/status?directory=...（attach_auth=True）
+    - permission_state()GET /api/permission-auto-accept（attach_auth=True）
+    """
+
+    def __init__(self, transport: OpenChamberReadTransport) -> None:
+        self.transport = transport
+
+    def health(self) -> OpenChamberObservation:
+        return self._observe(
+            "health", "/health", attach_auth=False, top_shape=dict, empty_semantics=None
+        )
+
+    def list_sessions(self, directory: str) -> OpenChamberObservation:
+        directory = _require_directory(directory, "list_sessions")
+        query = urllib.parse.urlencode({"directory": directory})
+        return self._observe(
+            "list_sessions",
+            f"/api/session?{query}",
+            attach_auth=True,
+            top_shape=list,
+            empty_semantics=NO_SESSION_OBSERVED_IN_DIRECTORY,
+        )
+
+    def session_status(self, directory: str) -> OpenChamberObservation:
+        directory = _require_directory(directory, "session_status")
+        query = urllib.parse.urlencode({"directory": directory})
+        return self._observe(
+            "session_status",
+            f"/api/session/status?{query}",
+            attach_auth=True,
+            top_shape=dict,
+            empty_semantics=NO_STATUS_ENTRY_OBSERVED_IN_DIRECTORY,
+        )
+
+    def permission_state(self) -> OpenChamberObservation:
+        obs = self._observe(
+            "permission_state",
+            "/api/permission-auto-accept",
+            attach_auth=True,
+            top_shape=dict,
+            empty_semantics=None,
+        )
+        payload = obs.payload
+        sessions = payload.get("sessions")
+        revision = payload.get("revision")
+        valid = (
+            isinstance(sessions, dict)
+            and isinstance(revision, int)
+            and not isinstance(revision, bool)
+            and all(isinstance(v, bool) for v in sessions.values())
+        )
+        if not valid:
+            raise OpenChamberApiError(
+                KIND_UNEXPECTED_SHAPE,
+                "permission_state",
+                status=obs.http_status,
+                detail="permission 结构不符：sessions 须为 dict 且值全为 bool、revision 须为 int（不解析具体 session ID）",
+            )
+        return obs
+
+    def _observe(
+        self,
+        endpoint: str,
+        path: str,
+        *,
+        attach_auth: bool,
+        top_shape: type,
+        empty_semantics: str | None,
+    ) -> OpenChamberObservation:
+        resp = self.transport.get(path, attach_auth=attach_auth)
+        if resp.status < 200 or resp.status >= 300:
+            _raise_http_error(endpoint, resp)
+        try:
+            payload = json.loads(resp.body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise OpenChamberApiError(
+                KIND_MALFORMED_JSON, endpoint, status=resp.status, detail="2xx 响应体不是合法 JSON"
+            ) from None
+        if not isinstance(payload, top_shape):
+            raise OpenChamberApiError(
+                KIND_UNEXPECTED_SHAPE,
+                endpoint,
+                status=resp.status,
+                detail=f"顶层应为 {top_shape.__name__}",
+            )
+        missing = empty_semantics if len(payload) == 0 else None
+        return OpenChamberObservation(
+            endpoint=endpoint, http_status=resp.status, payload=payload, missing_semantics=missing
         )
