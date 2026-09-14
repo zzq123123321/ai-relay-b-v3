@@ -84,13 +84,15 @@ class FakeTransport:
         return {"message_ids": ["m1", "m2"]}
 
     def send_once(self, *, endpoint: str, session_id: str, prompt_text: str,
-                  operation_id: str) -> SendAttempt:
+                  operation_id: str,
+                  planned_remote_user_id: str | None = None) -> SendAttempt:
         self.send_calls += 1
         if self.db is not None:
             self.send_in_txn.append(self.db.in_transaction)
         self.sent_payloads.append(
             {"endpoint": endpoint, "session_id": session_id, "prompt_text": prompt_text,
-             "operation_id": operation_id}
+             "operation_id": operation_id,
+             "planned_remote_user_id": planned_remote_user_id}
         )
         self.remote_received = True
         if self.mode == FakeMode.TIMEOUT_AFTER_SIDE_EFFECT:
@@ -99,7 +101,7 @@ class FakeTransport:
             return SendAttempt(outcome=SendOutcome.REJECTED,
                                evidence={"promptDispatched": False})
         return SendAttempt(outcome=SendOutcome.ACCEPTED,
-                           remote_user_id=self.remote_user_id,
+                           remote_user_id=planned_remote_user_id or self.remote_user_id,
                            evidence={"message_id": "msg-1"})
 
 
@@ -195,7 +197,9 @@ class TestDispatchBasics:
         record = dispatch._ops.read_by_key(p.operation_key)
         assert record is not None
         assert record.state == "ACCEPTED"
-        assert record.remote_user_id == "user-alice-001"
+        assert record.remote_user_id  # T22-02：ACCEPTED 保留 planned remote identity
+        assert record.remote_user_id.startswith("msg_")
+        assert fake.sent_payloads[0]["planned_remote_user_id"] == record.remote_user_id
         assert 'message_ids' in record.pre_snapshot_json
         assert "[AI_RELAY_TASK_ID:" in record.prompt_text
         assert "[AI_RELAY_ATTEMPT_ID:" in record.prompt_text
@@ -530,6 +534,7 @@ class TestIdempotency:
             first = ops.prepare_in(
                 dispatch_env[0].connection, proposal=pa,
                 operation_id=derive_operation_id(pa.operation_key),
+                remote_user_id="msg_first",
                 pre_snapshot_json="{}", prompt_text="A", prompt_hash="h1",
                 created_at=_T0,
             )
@@ -539,6 +544,7 @@ class TestIdempotency:
             second = ops.prepare_in(
                 dispatch_env[0].connection, proposal=pb,
                 operation_id=derive_operation_id(pb.operation_key),
+                remote_user_id="msg_second",
                 pre_snapshot_json="{}", prompt_text="B", prompt_hash="h2",
                 created_at=_T0,
             )

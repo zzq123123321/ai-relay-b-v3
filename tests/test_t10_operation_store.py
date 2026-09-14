@@ -44,6 +44,8 @@ _V1 = (
 _T0 = "2026-10-01T09:00:00+00:00"
 _WALL = datetime(2026, 10, 1, 9, 0, 0, tzinfo=timezone.utc)
 _ENDPOINT = "http://127.0.0.1:57123"
+# T22-02A：planned remote message identity——PREPARED 落库时已 durable，finalize 永不覆盖。
+_PLANNED_REMOTE_USER_ID = "msg_t10_planned_001"
 
 
 @pytest.fixture
@@ -133,6 +135,7 @@ def _prepare(ops: OperationStore, conn, proposal, *, now: str = _T0):
         pre_snapshot_json='{"message_ids": ["m1", "m2"]}',
         prompt_text=sha256_hex(proposal.prompt_body),
         prompt_hash=sha256_hex(proposal.prompt_body),
+        remote_user_id=_PLANNED_REMOTE_USER_ID,
         created_at=now,
     )
 
@@ -148,6 +151,7 @@ class TestPrepare:
         record = ops.read_by_key(p.operation_key)
         assert record is not None
         assert record.state == "PREPARED"
+        assert record.remote_user_id == _PLANNED_REMOTE_USER_ID
         assert record.operation_id == derive_operation_id(p.operation_key)
         assert record.kind == "INITIAL_SEND"
         assert record.task_key == task_key
@@ -304,14 +308,15 @@ class TestTransitions:
             final = ops.finalize_in(
                 db.connection, proposal=p,
                 operation_id=derive_operation_id(p.operation_key),
-                target_state="ACCEPTED", remote_user_id="user-alice-001",
+                target_state="ACCEPTED",
+                remote_user_id="msg_transport_observed_other",
                 evidence_json='{"message_id": "msg-1"}', finalized_at=_T0, now=_T0,
             )
         assert final.outcome is FinalizeOutcome.FINALIZED
         record = ops.read_by_key(p.operation_key)
         assert record is not None
         assert record.state == "ACCEPTED"
-        assert record.remote_user_id == "user-alice-001"
+        assert record.remote_user_id == _PLANNED_REMOTE_USER_ID  # finalize 不覆盖 planned
         assert json.loads(record.evidence_json) == {"message_id": "msg-1"}
         assert record.finalized_at == _T0
 
@@ -334,6 +339,8 @@ class TestTransitions:
             )
         assert final.outcome is FinalizeOutcome.FINALIZED
         assert _op_state(db, p.operation_key) == "REJECTED"
+        record = ops.read_by_key(p.operation_key)
+        assert record.remote_user_id == _PLANNED_REMOTE_USER_ID  # REJECTED 保留 planned
 
     def test_sending_to_unknown(self, store_env):
         db, _, ops, _, _, _ = store_env
@@ -355,6 +362,7 @@ class TestTransitions:
         assert final.outcome is FinalizeOutcome.FINALIZED
         assert _op_state(db, p.operation_key) == "UNKNOWN"
         record = ops.read_by_key(p.operation_key)
+        assert record.remote_user_id == _PLANNED_REMOTE_USER_ID  # UNKNOWN 保留 planned
         assert record.finalized_at == _T0
 
     def test_unknown_reconciled_to_accepted(self, store_env):

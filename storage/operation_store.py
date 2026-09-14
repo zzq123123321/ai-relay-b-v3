@@ -344,27 +344,43 @@ class OperationStore:
         pre_snapshot_json: str,
         prompt_text: str,
         prompt_hash: str,
+        remote_user_id: str | None = None,
         created_at: str,
     ) -> PrepareResult:
-        """事务内写 PREPARED。
+        """事务内写 PREPARED（T22-02 §5：planned remote identity 同事务原子落库）。
+
+        remote_user_id 为 planned remote user/message identity：只在此处创建时
+        写入一次，之后恢复/终态都不重新生成或覆盖（finalize 完全不更新该列）。
+        发送类 operation（INITIAL_SEND/CONTINUE）新建 PREPARED 时 planned identity
+        必须非空：blank → OperationStoreError（fail-closed），绝不允许
+        PREPARED + remote_user_id=NULL/blank 的新记录。该检查只作用于 INSERT 新建，
+        不校验 existing/conflict 分支（existing 行已有既存 id）。
 
         同 operation_key 收敛：首次插入成功 → CREATED；UNIQUE 冲突时重读判定身份——
         相同 → EXISTING（幂等复用），不同 → CONFLICT（原 operation 不修改）。
         """
         self._advance(conn)
+        if (
+            proposal.kind in _SEND_KINDS
+            and (not remote_user_id or not remote_user_id.strip())
+        ):
+            raise OperationStoreError(
+                "发送类 operation 禁止产生 PREPARED + 空 remote_user_id："
+                "planned remote identity 缺失"
+            )
         try:
             conn.execute(
                 "INSERT INTO operations (operation_id, operation_key, kind, task_key,"
                 " attempt_id, authority_epoch, control_revision, endpoint, session_id,"
                 " project_key, interruption_id, state, pre_snapshot_json, prompt_hash,"
-                " prompt_text, evidence_json, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " prompt_text, remote_user_id, evidence_json, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     operation_id, proposal.operation_key, proposal.kind, proposal.task_key,
                     proposal.attempt_id, proposal.authority_epoch, proposal.control_revision,
                     proposal.endpoint, proposal.session_id, proposal.project_key,
                     proposal.interruption_id, _STATE_PREPARED, pre_snapshot_json,
-                    prompt_hash, prompt_text, "{}", created_at, created_at,
+                    prompt_hash, prompt_text, remote_user_id, "{}", created_at, created_at,
                 ),
             )
         except sqlite3.IntegrityError:
@@ -444,16 +460,22 @@ class OperationStore:
         proposal: DispatchProposalLike,
         operation_id: str,
         target_state: str,
-        remote_user_id: str | None,
+        remote_user_id: str | None = None,
         evidence_json: str,
         finalized_at: str,
         now: str,
     ) -> FinalizeResult:
         """事务内最终态写入（SENDING → ACCEPTED/REJECTED/UNKNOWN；统计收敛用 SENDING 源）。
 
+        T22-02 §9：finalize SQL 完全不更新 remote_user_id——planned remote identity
+        只在 PREPARED 写一次，任何终点（ACCEPTED/REJECTED/UNKNOWN）与恢复路径都保留之。
+        remote_user_id 参数保留仅为兼容既有调用方，实际逐字节不再写入该列
+        （None 不覆盖、非 None 也不能覆盖 authoritative planned id）。
+
         UNKNOWN 允许经对账收敛到 ACCEPTED/REJECTED（core.domain 状态机）；任何反向
         （终态 → SENDING、UNKNOWN → SENDING）一律拒绝且不修改数据。
         """
+        del remote_user_id
         row = conn.execute(
             "SELECT operation_id, state FROM operations WHERE operation_key=?",
             (proposal.operation_key,),
@@ -474,10 +496,10 @@ class OperationStore:
                                   operation_id=current_id, state=from_state)
         self._advance(conn)
         cursor = conn.execute(
-            "UPDATE operations SET state=?, remote_user_id=?, evidence_json=?,"
+            "UPDATE operations SET state=?, evidence_json=?,"
             " finalized_at=?, updated_at=? WHERE operation_key=? AND operation_id=?"
             " AND state=?",
-            (target_state, remote_user_id, evidence_json, finalized_at, now,
+            (target_state, evidence_json, finalized_at, now,
              proposal.operation_key, operation_id, from_state),
         )
         if cursor.rowcount != 1:

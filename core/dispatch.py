@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -78,7 +79,8 @@ class SendTransport(Protocol):
     ) -> dict: ...
 
     def send_once(
-        self, *, endpoint: str, session_id: str, prompt_text: str, operation_id: str
+        self, *, endpoint: str, session_id: str, prompt_text: str, operation_id: str,
+        planned_remote_user_id: str | None,
     ) -> SendAttempt: ...
 
 
@@ -161,6 +163,17 @@ def derive_operation_id(operation_key: str) -> str:
     return f"op-{sha256_hex(operation_key)[:32]}"
 
 
+def default_remote_user_id_factory(operation_key: str) -> str:
+    """生成 planned remote user/message identity（T22-02 §3）。
+
+    样式 msg_ 前缀 + 足够随机十六进制：非空、风格 msg_ 开头、唯一概率足够高。
+    该值只在真正创建新 PREPARED 时生成；持久化的值才是 crash 恢复与 POST 用
+    的权威身份，transport 不得自行重推导/重生成。
+    """
+    del operation_key
+    return "msg_" + secrets.token_hex(16)
+
+
 def _wire_markers(*, task_key: str, attempt_id: str, operation_id: str) -> str:
     return (
         f"[AI_RELAY_TASK_ID: {task_key}]\n"
@@ -195,11 +208,15 @@ class DispatchService:
         operation_store: OperationStore | None = None,
         clock: Clock | None = None,
         operation_id_factory=None,
+        remote_user_id_factory=None,
     ) -> None:
         self._db = db
         self._ops = operation_store if operation_store is not None else OperationStore(db)
         self._clock = clock if clock is not None else SystemClock()
         self._op_id_factory = operation_id_factory or derive_operation_id
+        self._remote_user_id_factory = (
+            remote_user_id_factory or default_remote_user_id_factory
+        )
 
     # ---------------------------------------------------------------- phases
 
@@ -281,10 +298,16 @@ class DispatchService:
                         operation_key=proposal.operation_key,
                         detail=f"PREPARED 落库时权威检查未通过：{second.detail}",
                     )
+                planned = self._remote_user_id_factory(proposal.operation_key)
+                if not planned or not planned.strip():
+                    raise DispatchError(
+                        "remote_user_id_factory 产生空 identity：拒绝创建无计划身份的 PREPARED"
+                    )
                 prepared = self._ops.prepare_in(
                     conn,
                     proposal=proposal,
                     operation_id=operation_id,
+                    remote_user_id=planned,
                     pre_snapshot_json=snapshot_json,
                     prompt_text=prompt,
                     prompt_hash=prompt_hash,
@@ -340,6 +363,14 @@ class DispatchService:
                 operation_id=existing.operation_id,
                 state=existing.state,
                 detail="同 key 操作已非 PREPARED：发送权已被占用或已是终态",
+            )
+        if not existing.remote_user_id or not existing.remote_user_id.strip():
+            return DispatchResult(
+                outcome=DispatchOutcome.SEND_RIGHT_REVOKED,
+                operation_key=proposal.operation_key,
+                operation_id=existing.operation_id,
+                state=existing.state,
+                detail="PREPARED 缺少 durable remote identity：拒绝取得发送权（fail-closed，send=0）",
             )
         try:
             with self._db.transaction():
@@ -413,20 +444,34 @@ class DispatchService:
                 state=existing.state,
                 detail="操作当前不是 SENDING：必须先 acquire_send_right 成功",
             )
+        planned_id = existing.remote_user_id
+        if not planned_id or not planned_id.strip():
+            return DispatchResult(
+                outcome=DispatchOutcome.SEND_RIGHT_REVOKED,
+                operation_key=operation_key,
+                operation_id=existing.operation_id,
+                state=existing.state,
+                detail="SENDING 缺少 durable remote identity：禁止以无计划身份的发送（fail-closed，send=0）",
+            )
         try:
             attempt = transport.send_once(
                 endpoint=existing.endpoint,
                 session_id=existing.session_id,
                 prompt_text=existing.prompt_text,
                 operation_id=existing.operation_id,
+                planned_remote_user_id=planned_id,
             )
         except Exception as exc:
             unknown = SendAttempt(outcome=SendOutcome.UNKNOWN, evidence={})
             return self._finalize_sent(
                 proposal, existing.operation_id, unknown, now_iso,
+                planned_remote_user_id=planned_id,
                 detail=f"send_once 异常，远端结果不明：{type(exc).__name__}: {exc}",
             )
-        return self._finalize_sent(proposal, existing.operation_id, attempt, now_iso)
+        return self._finalize_sent(
+            proposal, existing.operation_id, attempt, now_iso,
+            planned_remote_user_id=planned_id,
+        )
 
     # ---------------------------------------------------------------- convenience
 
@@ -479,6 +524,7 @@ class DispatchService:
         attempt: SendAttempt,
         now_iso: str,
         *,
+        planned_remote_user_id: str | None = None,
         detail: str = "",
     ) -> DispatchResult:
         target = {
@@ -487,6 +533,13 @@ class DispatchService:
             SendOutcome.UNKNOWN: DispatchOutcome.UNKNOWN,
         }[attempt.outcome]
         evidence = dict(attempt.evidence or {})
+        if (
+            planned_remote_user_id
+            and attempt.remote_user_id
+            and attempt.remote_user_id != planned_remote_user_id
+        ):
+            target = DispatchOutcome.UNKNOWN
+            evidence["remote_identity_mismatch"] = True
         if detail:
             evidence.setdefault("transport_error", detail)
         try:
@@ -497,7 +550,6 @@ class DispatchService:
                     proposal=proposal,
                     operation_id=operation_id,
                     target_state=target.value.upper(),
-                    remote_user_id=attempt.remote_user_id,
                     evidence_json=json.dumps(evidence, ensure_ascii=False, sort_keys=True),
                     finalized_at=now_iso,
                     now=now_iso,

@@ -126,7 +126,16 @@ class FakeExecutor:
         return {"message_ids": ["fake-pre-snapshot"], "endpoint": endpoint}
 
     def send_once(self, *, endpoint: str, session_id: str, prompt_text: str,
-                  operation_id: str) -> SendAttempt:
+                  operation_id: str,
+                  planned_remote_user_id: str | None = None) -> SendAttempt:
+        """T22-02 发送 seam：显式携带 ledger 的 planned remote identity。
+
+        ACCEPT → SendAttempt.remote_user_id = planned（与 ledger 相同，允许 ACCEPTED）；
+        REJECT → remote_user_id=None；UNKNOWN timeout → 按现有异常语义上抛
+        TransportTimeoutError，ledger planned id 由 DispatchService 保留。
+        sent_payloads 记录 planned_remote_user_id 供验收断言。默认值 None 仅为兼容
+        直接调用本方法的历史测试，生产路径由 DispatchService 始终传入非空 planned。
+        """
         self.send_calls += 1
         if self.db is not None:
             self.send_in_txn.append(self.db.in_transaction)
@@ -145,6 +154,7 @@ class FakeExecutor:
             {
                 "endpoint": endpoint, "session_id": session_id,
                 "prompt_text": prompt_text, "operation_id": operation_id,
+                "planned_remote_user_id": planned_remote_user_id,
                 "task_key": task_key, "attempt_id": attempt_id,
             }
         )
@@ -159,7 +169,7 @@ class FakeExecutor:
             raise TransportTimeoutError("Fake 模拟远端已收到但客户端超时（结果不明）")
         return SendAttempt(
             outcome=SendOutcome.ACCEPTED,
-            remote_user_id=_REMOTE_USER_ID,
+            remote_user_id=planned_remote_user_id or _REMOTE_USER_ID,
             evidence={"message_id": _REMOTE_MESSAGE_ID},
         )
 
