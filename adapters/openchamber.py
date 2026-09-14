@@ -1,8 +1,16 @@
-"""AI Relay B V3.0：OpenChamber 只读 Transport 基座（T20-01）。
+"""AI Relay B V3.0：OpenChamber Transport 基座（T20 只读 + T22 prompt 写）。
 
 只读传输层：对外唯一 HTTP 能力是 GET，不实现 post/put/patch/delete/send/
 create_session/compact/approve/stop/retry，也不暴露 request(method=...) 这类
 可传任意方法的通用入口。使用标准库 urllib，不新增第三方 HTTP 依赖。
+
+生产写能力（T22-03）由独立、用途限定的 OpenChamberPromptAsyncTransport 提供：
+- 与只读类分离：read transport/client 保持 GET-only，不新增任何写方法；
+- 构造期冻结配置（base_url/directory/provider_id/model_id/agent/variant/token/
+  timeout），不动态回读 SettingsService；
+- 写目标 fail-closed：仅允许精确 loopback 白名单 {localhost, 127.0.0.1, ::1}；
+- 唯一 side-effect 路径 = POST /api/session/{sid}/prompt_async?directory=<frozen>；
+- 发送前只读快照只做 GET 且只保存最小字段，绝不保存 message body / token。
 
 与 T19 封板 seam（scripts/probe_openchamber.py）保持一致：
 - 单条请求 = base_url + path 直接拼接（同一构造路径）；
@@ -35,7 +43,18 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.dispatch import (
+    SendAttempt,
+    SendOutcome,
+    SendTransportError,
+    SnapshotFailure,
+)
+
 MAX_BODY_BYTES = 4 * 1024 * 1024
+
+# T22：prompt_async 写传输常量
+SESSION_ID_PREFIXES = ("sess_", "ses_")
+PROMPT_ASYNC_PATH_TMPL = "/api/session/{sid}/prompt_async"
 
 # 可自动携带本地 token 的精确主机白名单（不区分大小写，不扩展 127/8）
 LOCAL_AUTH_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -398,3 +417,325 @@ class OpenChamberReadClient:
         return OpenChamberObservation(
             endpoint=endpoint, http_status=resp.status, payload=payload, missing_semantics=missing
         )
+
+
+# =====================================================================
+# T22-03：生产 prompt_async 写 Transport（独立、用途限定）
+# =====================================================================
+
+def is_valid_session_id(value: object) -> bool:
+    """合法 session id：字符串 + ses_/sess_ 前缀 + 前缀后仍有非空内容。
+
+    与 T21 smoke 探测同一前缀语义（ACCEPTED_SESSION_ID_PREFIXES），精确前缀判定，
+    不以 ipaddress/宽松网络判定冒充。
+    """
+    if not isinstance(value, str):
+        return False
+    for prefix in SESSION_ID_PREFIXES:
+        if value.startswith(prefix) and len(value) > len(prefix):
+            return True
+    return False
+
+
+def _endpoint_matches(frozen_base_url: str, endpoint: str) -> bool:
+    """endpoint 是否等于构造冻结 base_url（统一 trailing-slash normalization）。
+
+    只允许去掉末尾斜杠这一规范化；不做 host/port/path 的静默改写，不同即不匹配。
+    """
+    return isinstance(endpoint, str) and endpoint.rstrip("/") == frozen_base_url.rstrip("/")
+
+
+def _non_redirecting_write_opener() -> urllib.request.OpenerDirector:
+    """生产写 opener：仅 HTTP/HTTPS handler。
+
+    不含 HTTPRedirectHandler（3xx 原样返回，绝不跟进 Location），也不含
+    HTTPErrorProcessor（4xx/5xx 原样返回，由调用方分类）。连接层错误
+    （超时/URLError/OSError）照常上抛。
+    """
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    return opener
+
+
+def _make_urllib_write_call(timeout: float):
+    opener = _non_redirecting_write_opener()
+    return lambda req: opener.open(req, timeout=timeout)
+
+
+class OpenChamberPromptTransportError(SendTransportError):
+    """prompt_async 写传输错误：结果不明（可能已投递），adapter 内绝不重试。
+
+    kind 为稳定分类（TIMEOUT / CONNECTION / ENDPOINT_MISMATCH /
+    INVALID_SESSION_ID / MISSING_PLANNED_ID / INVALID_PLANNED_ID /
+    NON_LOOPBACK_TARGET / MISSING_CONFIG）。detail 只含静态排查上下文，
+    绝不携带远端 response body、token 或 Authorization。
+    """
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        super().__init__(f"{kind}: {detail}".rstrip(": "))
+        self.kind = kind
+
+
+class OpenChamberPromptAsyncTransport:
+    """T22-03：生产 prompt_async 发送 Transport（仅本类公开写面）。
+
+    - 构造期冻结全部配置（base_url/directory/provider_id/model_id/agent/variant/
+      token/timeout），绝不动态回读 SettingsService；测试 seam 注入
+      read_opener / write_opener（均为可调用，入参 urllib Request）；
+    - 写目标 fail-closed：base_url 非精确 loopback 白名单
+      {localhost,127.0.0.1,::1} → 构造期拒绝（0 HTTP），不扩展 127/8；
+    - 唯一 side-effect：POST /api/session/{sid}/prompt_async?directory=<frozen>；
+      body 严格仅 5 个已实证顶层 key（messageID/model/agent/variant/parts）；
+    - send 前快照（capture_pre_send_snapshot）只 GET，只保存最小字段；
+    - 不自动重试、不 redirect-follow、不做 reconciliation、不再生任何 identity。
+
+    单次 send_once() 最多触发 1 次 write opener 调用；出错不重试。
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        directory: str,
+        *,
+        provider_id: str,
+        model_id: str,
+        agent: str,
+        variant: str = "default",
+        token: str | None = None,
+        timeout: float = 3.0,
+        read_opener=None,
+        write_opener=None,
+    ) -> None:
+        self.base_url = _validate_base_url(base_url)
+        if not is_loopback_base_url(self.base_url):
+            raise OpenChamberPromptTransportError(
+                "NON_LOOPBACK_TARGET",
+                "生产写目标仅允许精确本机白名单 {localhost,127.0.0.1,::1}：拒绝构造（0 HTTP）",
+            )
+        self.directory = _require_nonblank(directory, "directory")
+        self.provider_id = _require_nonblank(provider_id, "provider_id")
+        self.model_id = _require_nonblank(model_id, "model_id")
+        self.agent = _require_nonblank(agent, "agent")
+        self.variant = _require_nonblank(variant, "variant")
+        self.timeout = float(timeout)
+        self._token = token.strip() if isinstance(token, str) and token.strip() else None
+        self._read = OpenChamberReadTransport(
+            self.base_url, token=self._token, timeout=self.timeout, opener=read_opener
+        )
+        self._write_call = write_opener if write_opener is not None else _make_urllib_write_call(
+            self.timeout
+        )
+
+    # ------------------------------------------------------ pre-send snapshot（GET-only）
+
+    def capture_pre_send_snapshot(
+        self, *, endpoint: str, session_id: str, task_key: str
+    ) -> dict:
+        """发送前只读快照：只 GET、只保存最小字段；任一必要观察失败 → SnapshotFailure。
+
+        快照只保存 session_exists / message_count / message_ids / user_message_ids /
+        status_entry_present，绝不保存 message body、assistant 正文、token、
+        Authorization 或 cookie。失败一律张 SnapshotFailure（0 POST，明确不是 UNKNOWN）。
+        """
+        if not _endpoint_matches(self.base_url, endpoint):
+            raise SnapshotFailure(
+                f"endpoint={endpoint!r} 与构造冻结 base_url={self.base_url!r} "
+                "不一致：拒绝快照（0 HTTP）"
+            )
+        if not is_valid_session_id(session_id):
+            raise SnapshotFailure(
+                f"非法 session_id={session_id!r}（只接受 ses_/sess_ 前缀）：拒绝快照（0 HTTP）"
+            )
+        del task_key  # send 前快照不依赖 task_key；仅保留签名兼容
+
+        session_payload = self._snapshot_json(
+            "session list", "/api/session?" + self._directory_query()
+        )
+        if not isinstance(session_payload, list):
+            raise SnapshotFailure("session list 顶层不是数组：快照中止（0 POST）")
+        found = False
+        for entry in session_payload:
+            if isinstance(entry, dict) and entry.get("id") == session_id:
+                found = True
+                break
+        if not found:
+            raise SnapshotFailure(
+                f"session list 不存在预期会话 {session_id!r}：快照中止（0 POST）"
+            )
+
+        message_path = (
+            f"/api/session/{urllib.parse.quote(session_id, safe='')}/message?"
+            + self._directory_query()
+        )
+        message_payload = self._snapshot_json("message list", message_path)
+        if not isinstance(message_payload, list):
+            raise SnapshotFailure("message list 顶层不是数组：快照中止（0 POST）")
+        message_ids: list[str] = []
+        user_message_ids: list[str] = []
+        for index, item in enumerate(message_payload):
+            if not isinstance(item, dict):
+                raise SnapshotFailure(f"message[{index}] 不是对象：快照中止（0 POST）")
+            info = item.get("info")
+            if not isinstance(info, dict):
+                raise SnapshotFailure(
+                    f"message[{index}] 缺少 info 对象，不符 T21 封板形状 "
+                    "{{info:{{id,role,parentID}},parts:[...]}}：快照中止（0 POST）"
+                )
+            mid = info.get("id")
+            role = info.get("role")
+            if not isinstance(mid, str) or not mid:
+                raise SnapshotFailure(f"message[{index}] info.id 缺失/非法：快照中止（0 POST）")
+            if role is not None and not isinstance(role, str):
+                raise SnapshotFailure(f"message[{index}] info.role 非法：快照中止（0 POST）")
+            message_ids.append(mid)
+            if role == "user":
+                user_message_ids.append(mid)
+
+        status_payload = self._snapshot_json(
+            "session status", "/api/session/status?" + self._directory_query()
+        )
+        if not isinstance(status_payload, dict):
+            raise SnapshotFailure("session status 顶层不是对象：快照中止（0 POST）")
+        return {
+            "session_exists": True,
+            "message_count": len(message_ids),
+            "message_ids": message_ids,
+            "user_message_ids": user_message_ids,
+            "status_entry_present": bool(status_payload),
+        }
+
+    # ------------------------------------------------------ send_once（唯一写入口）
+
+    def send_once(
+        self,
+        *,
+        endpoint: str,
+        session_id: str,
+        prompt_text: str,
+        operation_id: str,
+        planned_remote_user_id: str | None,
+    ) -> SendAttempt:
+        """执行单次 prompt_async POST（最多 1 次 opener 调用）。
+
+        - planned_remote_user_id 只来自 ledger（nonblank + msg_ 前缀），绝不重新生成；
+        - 204 → ACCEPTED（remote_user_id=planned）；400-499 → REJECTED；
+          其他（5xx/3xx/unexpected 2xx）→ UNKNOWN；任何传输异常上抛
+          OpenChamberPromptTransportError（Dispatch 视为结果不明）。
+        - evidence 只保留 http_status + classification，绝不保存远端响应正文。
+        """
+        del operation_id  # body 不含独立 operationID 字段；identity 只来自 ledger planned id
+        if not _endpoint_matches(self.base_url, endpoint):
+            raise OpenChamberPromptTransportError(
+                "ENDPOINT_MISMATCH",
+                "send 目标与构造冻结 base_url 不一致：拒绝发送（0 HTTP）",
+            )
+        if not is_valid_session_id(session_id):
+            raise OpenChamberPromptTransportError(
+                "INVALID_SESSION_ID",
+                f"非法 session_id={session_id!r}（只接受 ses_/sess_ 前缀）：拒绝发送（0 HTTP）",
+            )
+        if not isinstance(planned_remote_user_id, str) or not planned_remote_user_id.strip():
+            raise OpenChamberPromptTransportError(
+                "MISSING_PLANNED_ID", "planned_remote_user_id 为空：拒绝发送（0 HTTP）"
+            )
+        planned = planned_remote_user_id.strip()
+        if not planned.startswith("msg_"):
+            raise OpenChamberPromptTransportError(
+                "INVALID_PLANNED_ID",
+                "planned_remote_user_id 非 msg_ 前缀：拒绝发送（0 HTTP）",
+            )
+
+        path = PROMPT_ASYNC_PATH_TMPL.format(sid=urllib.parse.quote(session_id, safe=""))
+        url = f"{self.base_url}{path}?{self._directory_query()}"
+        body = {
+            "messageID": planned,
+            "model": {"providerID": self.provider_id, "modelID": self.model_id},
+            "agent": self.agent,
+            "variant": self.variant,
+            "parts": [{"type": "text", "text": prompt_text}],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        req = urllib.request.Request(
+            url, method="POST", headers=headers,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        )
+        status = self._post_status(req)
+        return _send_attempt_from_status(status, planned)
+
+    # ------------------------------------------------------ internals
+
+    def _directory_query(self) -> str:
+        return urllib.parse.urlencode({"directory": self.directory})
+
+    def _snapshot_json(self, what: str, path: str) -> object:
+        try:
+            resp = self._read.get(path, attach_auth=True)
+        except OpenChamberReadError as exc:
+            raise SnapshotFailure(
+                f"{what} GET 失败（{exc.kind}）：快照中止（0 POST）"
+            ) from exc
+        if not (200 <= resp.status < 300):
+            raise SnapshotFailure(f"{what} GET HTTP {resp.status}：快照中止（0 POST）")
+        try:
+            return json.loads(resp.body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise SnapshotFailure(
+                f"{what} GET 响应非合法 JSON：快照中止（0 POST）"
+            ) from exc
+
+    def _post_status(self, req: urllib.request.Request) -> int:
+        try:
+            raw = self._write_call(req)
+            status = int(getattr(raw, "status", None) or raw.getcode() or 0)
+            _read_bounded(raw, MAX_BODY_BYTES)  # 有界读取并丢弃，绝不解析为完成结果
+            return status
+        except urllib.error.HTTPError as exc:
+            _read_bounded(exc, MAX_BODY_BYTES)  # 有界读取并丢弃，绝不写远端正文进 evidence
+            return exc.code
+        except socket.timeout as exc:
+            raise OpenChamberPromptTransportError(
+                "TIMEOUT", "prompt_async POST 超时：结果不明，禁止重试"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise OpenChamberPromptTransportError(
+                "CONNECTION", f"{type(exc).__name__}: {exc.reason}"
+            ) from exc
+        except OSError as exc:
+            raise OpenChamberPromptTransportError(
+                "CONNECTION", f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+
+def _send_attempt_from_status(status: int, planned_id: str) -> SendAttempt:
+    """HTTP status → SendOutcome（204 唯一 ACCEPTED）。
+
+    400-499 → REJECTED（evidence 只含 http_status+classification）；
+    500-599 / 3xx / 除 204 外 unexpected 2xx / 其余 → UNKNOWN；
+    REJECTED/UNKNOWN 一律 remote_user_id=None。
+    """
+    if status == 204:
+        return SendAttempt(
+            outcome=SendOutcome.ACCEPTED,
+            remote_user_id=planned_id,
+            evidence={"http_status": 204, "classification": "accepted"},
+        )
+    if 400 <= status < 500:
+        return SendAttempt(
+            outcome=SendOutcome.REJECTED,
+            evidence={"http_status": status, "classification": "rejected"},
+        )
+    return SendAttempt(
+        outcome=SendOutcome.UNKNOWN,
+        evidence={"http_status": status, "classification": "unknown"},
+    )
+
+
+def _require_nonblank(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise OpenChamberPromptTransportError(
+            "MISSING_CONFIG", f"{name} 不能为空（任何 POST 之前拒绝）"
+        )
+    return value.strip()
