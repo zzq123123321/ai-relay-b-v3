@@ -1,0 +1,16 @@
+# 资料包与方案文档（不入库）
+AI_Relay_B_开发资料包_V3.0/
+AI_Relay_B_Lite_修正方案_v1.0.docx
+AI_Relay_B_Lite_修正方案_v1.0.pdf
+axis-video.lan.ts
+evidence/
+docs/decisions.md
+docs/environment.md
+
+# Python 运行时
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+config.json
