@@ -548,3 +548,66 @@ def test_watchdog_independent_of_a_connection():
     assert not any(name.startswith("cliplink") for name in vars(mod))
     ctrl = LiteController(client=FakeClient(), active_session_reader=lambda: SESSION)
     assert not any(attr.startswith("cliplink") for attr in vars(ctrl))
+
+
+# ===================== L05-02-FIX1 恢复三态 busy 保护 =====================
+
+def _snapshot(task):
+    return (
+        task.event_id,
+        task.wrapped_text,
+        task.state,
+        task.message_id,
+        task.error,
+        task.session_id,
+        task.directory,
+        task.recover_baseline,
+        task.recover_started_ms,
+        task.resume_attempted,
+    )
+
+
+# 1-4. MODEL_OFFLINE / RECOVER_CHECK / RESUME_SENT 收新任务 → busy 且旧任务完全不变
+def test_recovering_states_busy_preserve_old_task():
+    for state, attempted in (
+        (AUTO_MODEL_OFFLINE, False),
+        (AUTO_RECOVER_CHECK, False),
+        (AUTO_RESUME_SENT, True),
+    ):
+        client = FakeClient(
+            **ONLINE, send=SendResult(True, None, "m1"),
+            status=IDLE_ST, progress=PROG_BASE,
+        )
+        ctrl = _make_running(client)
+        task = ctrl._auto_task
+        task.state = state
+        task.recover_baseline = "base_marker"
+        task.recover_started_ms = 12345
+        task.resume_attempted = attempted
+        before = _snapshot(task)
+        n_sent = len(client.sent)
+        intake = ctrl.receive_auto_task("e_new", "OTHER", "{content}")
+        # busy
+        assert intake.accepted is False
+        assert intake.submitted is False
+        # 旧任务对象未被替换
+        assert ctrl._auto_task is task
+        # 全部字段保持（含 frozen session/message/recovery baseline）
+        assert _snapshot(task) == before
+        assert task.event_id == "e1"  # A端新 event_id 未替换
+        assert task.session_id == "ses_x"
+        assert task.directory == r"C:\work"
+        assert task.message_id == "m1"
+        # 无额外 send_text
+        assert len(client.sent) == n_sent
+
+
+# 5. IDLE（无任务）仍允许正常接收新任务
+def test_idle_still_accepts_new_task():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _ctrl(client, SESSION)
+    assert ctrl._auto_task is None  # 无任务 → 等价 IDLE
+    intake = ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert intake.accepted is True
+    assert intake.submitted is True  # 在线 → 直接 RUNNING
+    assert client.sent == [("ses_x", r"C:\work", "RAW")]

@@ -133,9 +133,10 @@ class LiteController:
         """A端 RemoteTask 入口：立即包装固化 → READY_TO_SEND → 单次尝试发送。
 
         包装与模型/OpenChamber/A端连接是否在线完全无关：到达即固化 wrapped_text。
-        已有 READY_TO_SEND 或 RUNNING 任务时返回 busy，不覆盖、不重发。
+        只要已有 AutoTask 且 state != IDLE 即返回 busy（READY_TO_SEND / RUNNING /
+        MODEL_OFFLINE / RECOVER_CHECK / RESUME_SENT 均算 busy），不覆盖、不重发。
         """
-        if self._auto_task is not None and self._auto_task.state in (AUTO_READY, AUTO_RUNNING):
+        if self._auto_task is not None and self._auto_task.state != AUTO_IDLE:
             return AutoTaskIntake(False, False)
         self._auto_task = AutoTask(
             event_id=event_id,
