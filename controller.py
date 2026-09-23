@@ -27,6 +27,22 @@ class CurrentSession:
     error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ModelConnectionResult:
+    """test_model_connection() 的稳定返回：严格区分 服务可达 与 配置就绪。
+
+    connected = OpenChamber 服务是否可达（probe）。
+    service_latency_ms = probe 测得的服务延迟（服务不可达时也可能非空）。
+    ready = 当前会话是否已有可复用的模型执行配置。
+    本轮不向模型发 prompt，connected/ready 均不代表已完成一次真实推理。
+    """
+
+    connected: bool
+    service_latency_ms: int | None
+    ready: bool
+    error: str | None
+
+
 class LiteController:
     def __init__(
         self,
@@ -79,3 +95,18 @@ class LiteController:
         if not session.valid:
             return CompactResult(False, session.error)
         return self._client.compact_session(session.session_id, session.directory)
+
+    def test_model_connection(self) -> ModelConnectionResult:
+        """无侵入检测大模型可用性：probe 服务可达 + 当前会话是否已有可复用模型配置。
+
+        本轮不向模型发 prompt。connected 只反映 OpenChamber 服务可达，ready 只反映
+        当前会话是否有可复用执行配置；二者都不等于“已真实完成一次模型推理”。
+        """
+        probe = self._client.probe()
+        if not probe.connected:
+            return ModelConnectionResult(False, probe.latency_ms, False, probe.error)
+        session = self._current_session()
+        if not session.valid:
+            return ModelConnectionResult(True, probe.latency_ms, False, None)
+        config = self._client.resolve_execution_config(session.session_id, session.directory)
+        return ModelConnectionResult(True, probe.latency_ms, config is not None, None)

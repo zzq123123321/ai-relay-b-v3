@@ -231,8 +231,8 @@ class MainWindow(QMainWindow):
         m_card, m_lay = self._card("大模型连接")
         m_card.setObjectName("llm_card")
         self._llm_status = self._status_label(m_lay, "● 未连接", "llm_status")
-        self._llm_oc = self._plain_label(m_lay, "OpenChamber服务延迟：-- ms")
-        self._llm_first = self._plain_label(m_lay, "模型首响应：-- ms")
+        self._llm_oc = self._plain_label(m_lay, "OpenChamber服务延迟：-- ms", "llm_oc")
+        self._llm_first = self._plain_label(m_lay, "模型首响应：-- ms", "llm_first")
         self._session_label = self._plain_label(m_lay, "当前会话：无", "session_label")
         m_lay.addStretch(1)
 
@@ -345,10 +345,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ 行为
     def _send_from_ui(self) -> None:
-        """把手动框内容原样发出（不修改、不套包装），随后清空输入框。"""
-        text = self._manual_edit.toPlainText()
-        self.manual_send_requested.emit(text)
-        self._manual_edit.setPlainText("")
+        """把手动框内容原样发出（不修改、不套包装）。
+
+        输入框保留原内容，由用户通过 [清空] 自行决定是否清除（accepted != 完成）。
+        """
+        self.manual_send_requested.emit(self._manual_edit.toPlainText())
 
     def _toggle_listening(self) -> None:
         self._listening = not self._listening
