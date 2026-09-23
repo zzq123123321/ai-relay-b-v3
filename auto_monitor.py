@@ -3,7 +3,8 @@
 Qt 主线程绝不跑 watchdog / 结果轮询的 HTTP：GUI 通过 submit_remote_task / acknowledge_result
 把命令丢进线程安全队列，worker 线程串行执行 controller 的自动任务状态机，并把简单事件
 （intake_ready/intake_running/intake_busy/sent/offline/recover_check/resumed_automatically/
-resume_sent/first_response/result_complete/result_ambiguous）放进事件队列供 GUI drain。
+resume_sent/first_response/result_complete/result_ambiguous/compact_success/compact_failed）
+放进事件队列供 GUI drain。
 
 只用标准库 threading + queue，不引入 asyncio/multiprocessing/scheduler/SQLite。
 单个 worker 线程保证同一时刻只有一个 watchdog HTTP 在执行。
@@ -24,7 +25,8 @@ class AutoMonitor:
     """后台自动任务 monitor：单 worker 线程循环 run_once()。
 
     controller 由外部注入（依赖 LiteController 的 receive_auto_task / watchdog_tick /
-    inspect_auto_task_result / begin_interrupted_recovery / finish_auto_task 五个方法）。
+    inspect_auto_task_result / begin_interrupted_recovery / compact_auto_task /
+    finish_auto_task 六个方法）。
     monitor 自己不访问 ClipLink 状态、不写剪贴板、不操作 Qt、不调 bridge.deliver_result。
     """
 
@@ -42,11 +44,18 @@ class AutoMonitor:
         self._result_complete_sent = False
         self._result_ambiguous_sent = False
         self._paused = False
+        # 自动压缩运行时开关：仅 worker 线程读写，默认 OFF，不持久化。
+        # GUI 经 set_auto_compact 入队更新；用 ack 处理时的最新值，不冻结到任务创建时。
+        self._auto_compact_enabled = False
 
     # ---------------- GUI 线程调用（线程安全：只入队，不做 HTTP）----------------
     def submit_remote_task(self, event_id: str, text: str, wrapper_template: str) -> None:
         """把 A端 RemoteTask 交给后台 worker 包装并首发送（主线程 0 HTTP）。"""
         self._cmd.put(("submit", event_id, text, wrapper_template))
+
+    def set_auto_compact(self, enabled: bool) -> None:
+        """GUI 线程调用：只把开关更新入队，不做任何 OpenChamber HTTP；worker 收到后生效。"""
+        self._cmd.put(("set_auto_compact", bool(enabled)))
 
     def acknowledge_result(self, event_id: str) -> None:
         """GUI 已把最终结果交给 ClipLinkBridge 后调用 → 后台释放当前任务。"""
@@ -105,6 +114,8 @@ class AutoMonitor:
                 self._handle_submit(cmd[1], cmd[2], cmd[3])
             elif cmd[0] == "ack":
                 self._handle_ack(cmd[1])
+            elif cmd[0] == "set_auto_compact":
+                self._auto_compact_enabled = bool(cmd[1])
 
     def _handle_submit(self, event_id: str, text: str, template: str) -> None:
         intake = self._controller.receive_auto_task(event_id, text, template)
@@ -120,7 +131,23 @@ class AutoMonitor:
         self._emit({"type": "intake_running" if intake.submitted else "intake_ready"})
 
     def _handle_ack(self, event_id: str) -> None:
-        if self._controller.finish_auto_task(event_id) and event_id == self._active_event_id:
+        """GUI 已把结果交给 Bridge 后释放任务：结果先回传，compact 才执行（绝不阻挡回传）。
+
+        event_id 不匹配当前活动任务（迟到/错 ack）→ 不 compact / 不 finish / 不 reset，
+        防压错、清错任务。auto_compact 开 → 用冻结 session compact 一次并发事件；
+        compact 失败只记 compact_failed，仍 finish（compact 失败 != 任务失败）。
+        """
+        if event_id != self._active_event_id:
+            return
+        if self._auto_compact_enabled:
+            result = self._controller.compact_auto_task(event_id)
+            if result.success:
+                self._emit({"type": "compact_success", "event_id": event_id})
+            else:
+                self._emit(
+                    {"type": "compact_failed", "event_id": event_id, "error": result.error or ""}
+                )
+        if self._controller.finish_auto_task(event_id):
             self._reset_task_flags()
 
     def _reset_task_flags(self) -> None:

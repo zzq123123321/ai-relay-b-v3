@@ -12,19 +12,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from auto_monitor import AutoMonitor
 from controller import AUTO_RUNNING, AutoTaskIntake, WatchdogTick
-from openchamber_client import TaskResultResult
+from openchamber_client import CompactResult, TaskResultResult
 
 
 class FakeMonitorController:
-    """LiteController 替身：只实现 AutoMonitor 依赖的 5 个方法，全部可脚本化。"""
+    """LiteController 替身：只实现 AutoMonitor 依赖的 6 个方法，全部可脚本化。"""
 
-    def __init__(self, intake=None, tick_action="none", result=None, begin_ok=True) -> None:
+    def __init__(self, intake=None, tick_action="none", result=None, begin_ok=True,
+                 compact=None) -> None:
         self.intake = intake
         self.tick_action = tick_action
         self.result = result
         self.begin_ok = begin_ok
+        self.compact_result = compact if compact is not None else CompactResult(True, None)
         self.receive_calls: list[tuple[str, str, str]] = []
         self.finish_calls: list[str] = []
+        self.compact_calls: list[str] = []
         self.tick_calls = 0
         self.inspect_calls = 0
         self.begin_calls = 0
@@ -64,6 +67,10 @@ class FakeMonitorController:
             self._event_id = None
             return True
         return False
+
+    def compact_auto_task(self, event_id):
+        self.compact_calls.append(event_id)
+        return self.compact_result
 
 
 def _types(monitor) -> list[str]:
@@ -171,7 +178,7 @@ def test_ack_releases_and_allows_next():
     assert fc.receive_calls == [("e1", "x", "{content}"), ("e2", "y", "{content}")]
 
 
-# 13b. ack 的 event_id 不匹配当前任务 → 不清（绝不清错任务）
+# 13b. ack 的 event_id 不匹配当前任务 → 不 compact / 不 finish / 不清（绝不清错任务）
 def test_ack_wrong_event_keeps_task():
     fc = FakeMonitorController()  # 默认 intake：无任务→接收，已有任务→busy
     mon = AutoMonitor(fc, 0.01)
@@ -181,7 +188,8 @@ def test_ack_wrong_event_keeps_task():
     mon.acknowledge_result("not_e1")
     mon.run_once()
     mon.drain_events()
-    assert fc.finish_calls == ["not_e1"]
+    assert fc.finish_calls == []  # 迟到/错 ack：不 finish
+    assert fc.compact_calls == []  # 也不 compact
     # 当前任务未被清：仍能收到重复 submit 的 busy
     mon.submit_remote_task("e9", "z", "{content}")
     mon.run_once()
@@ -232,6 +240,189 @@ def test_monitor_start_stop():
     finally:
         mon.stop()
     assert mon._thread is None
+
+
+# ===================== L05-06 自动压缩冻结会话 =====================
+
+DONE = TaskResultResult(True, True, "DONE", 100, False, False, None)
+
+
+# 08. AutoMonitor 默认 auto_compact=False
+def test_auto_compact_default_off():
+    mon = AutoMonitor(FakeMonitorController(), 0.01)
+    assert mon._auto_compact_enabled is False
+
+
+# 09. set_auto_compact(True) → GUI 只入队，run_once 后 worker 更新；GUI 路径 0 HTTP
+def test_set_auto_compact_updates_worker_state():
+    fc = FakeMonitorController()
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    assert mon._auto_compact_enabled is False  # 尚未 run_once，worker 未处理（GUI 无副作用）
+    assert fc.compact_calls == []
+    mon.run_once()  # worker 处理 set command
+    assert mon._auto_compact_enabled is True
+    mon.set_auto_compact(False)
+    mon.run_once()
+    assert mon._auto_compact_enabled is False
+
+
+# 10. auto_compact OFF + 正确 ack → compact 0 次，finish 1 次
+def test_auto_compact_off_ack_no_compact():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=DONE)
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    assert fc.compact_calls == []
+    assert fc.finish_calls == ["e1"]
+
+
+# 11. auto_compact ON + 正确 ack → compact 1 次，finish 1 次
+def test_auto_compact_on_ack_compacts_then_finishes():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=DONE)
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    assert fc.compact_calls == ["e1"]
+    assert fc.finish_calls == ["e1"]
+
+
+# 12. 顺序：compact_auto_task 必须在 finish_auto_task 之前
+def test_auto_compact_before_finish():
+    seq: list[str] = []
+
+    class OrderFC(FakeMonitorController):
+        def compact_auto_task(self, eid):
+            seq.append("compact")
+            return super().compact_auto_task(eid)
+
+        def finish_auto_task(self, eid):
+            seq.append("finish")
+            return super().finish_auto_task(eid)
+
+    fc = OrderFC(intake=AutoTaskIntake(True, True), result=DONE)
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    assert seq == ["compact", "finish"]
+
+
+# 13. compact success → compact_success 事件一次
+def test_auto_compact_success_event():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=DONE,
+                               compact=CompactResult(True, None))
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    evs = [e for e in mon.drain_events() if e["type"] == "compact_success"]
+    assert len(evs) == 1
+    assert evs[0]["event_id"] == "e1"
+
+
+# 14. compact failure → compact_failed 事件一次，且仍 finish 当前任务
+def test_auto_compact_failed_event_still_finishes():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=DONE,
+                               compact=CompactResult(False, "http: 500"))
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    evs = [e for e in mon.drain_events() if e["type"] == "compact_failed"]
+    assert len(evs) == 1
+    assert evs[0]["event_id"] == "e1"
+    assert evs[0]["error"] == "http: 500"
+    assert fc.finish_calls == ["e1"]
+
+
+# 15. compact failure 后 → flags reset，下一 RemoteTask 可接收
+def test_auto_compact_failed_resets_allows_next():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=DONE,
+                               compact=CompactResult(False, "http: 500"))
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("e1")
+    mon.run_once()
+    mon.drain_events()
+    mon.submit_remote_task("e2", "y", "{content}")
+    mon.run_once()
+    assert fc.receive_calls == [("e1", "x", "{content}"), ("e2", "y", "{content}")]
+
+
+# 16. stale/wrong ack → compact 0 / finish 0 / active 任务保留
+def test_stale_ack_no_compact_no_finish():
+    fc = FakeMonitorController()
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.drain_events()
+    mon.acknowledge_result("not_e1")
+    mon.run_once()
+    mon.drain_events()
+    assert fc.compact_calls == []
+    assert fc.finish_calls == []
+    mon.submit_remote_task("e9", "z", "{content}")
+    mon.run_once()
+    assert "intake_busy" in _types(mon)  # e1 仍占用
+
+
+# 17. ambiguous → 自动 compact 0 次（未产生 result_complete → 不 ack）
+def test_ambiguous_no_auto_compact():
+    ambiguous = TaskResultResult(True, False, None, None, True, False, None)
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=ambiguous,
+                               compact=CompactResult(True, None))
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.run_once()
+    mon.drain_events()
+    assert fc.compact_calls == []
+    assert fc.finish_calls == []
+
+
+# 18. interrupted/recovering → 自动 compact 0 次
+def test_interrupted_no_auto_compact():
+    interrupted = TaskResultResult(True, False, None, None, False, True, None)
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=interrupted,
+                               compact=CompactResult(True, None))
+    mon = AutoMonitor(fc, 0.01)
+    mon.set_auto_compact(True)
+    mon.run_once()
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    mon.run_once()
+    mon.drain_events()
+    assert fc.compact_calls == []
+    assert fc.finish_calls == []
 
 
 if __name__ == "__main__":

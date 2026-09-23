@@ -213,6 +213,23 @@ class LiteController:
         self._auto_task = None
         return True
 
+    def compact_auto_task(self, event_id: str) -> CompactResult:
+        """对已完成自动任务冻结的 session 做一次 compact（须由结果已交给 Bridge 后调用）。
+
+        无任务 / event_id 不匹配 / 任务尚未冻结 session_id → 失败且不调用 compact_session。
+        合法 → 直接用 AutoTask 冻结的 session_id/directory 调 client.compact_session，
+        绝不读 UI 当前激活会话。不 clear AutoTask、不变 state、不改 message_id/resume 历史；
+        任务释放仍由 finish_auto_task 单独负责。
+        """
+        task = self._auto_task
+        if task is None:
+            return CompactResult(False, "无活动自动任务")
+        if task.event_id != event_id:
+            return CompactResult(False, "event_id 不匹配当前自动任务")
+        if task.session_id is None:
+            return CompactResult(False, "自动任务尚未冻结执行会话")
+        return self._client.compact_session(task.session_id, task.directory)
+
     # ------------------------------------------------------------- 模型 watchdog
     def watchdog_tick(self, now_ms: int | None = None) -> WatchdogTick:
         """纯控制入口：推进自动任务中断恢复状态机，本轮由测试/后续 worker 调用。

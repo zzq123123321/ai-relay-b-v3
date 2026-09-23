@@ -55,6 +55,7 @@ class FakeController:
         self.model_calls = 0
         self.sent_texts = []
         self.compact_calls = 0
+        self.auto_compact_calls: list[str] = []
         self.finish_calls: list[str] = []
         self.auto_intakes: list[tuple[str, str, str]] = []
 
@@ -86,6 +87,10 @@ class FakeController:
     def finish_auto_task(self, event_id) -> bool:
         self.finish_calls.append(event_id)
         return True
+
+    def compact_auto_task(self, event_id):
+        self.auto_compact_calls.append(event_id)
+        return self._compact
 
 
 class FakeBridge:
@@ -125,10 +130,14 @@ class FakeMonitor:
         self.submit_calls: list[tuple[str, str, str]] = []
         self.ack_calls: list[str] = []
         self.stop_calls = 0
+        self.auto_compact_calls: list[bool] = []
         self._events: list[dict] = []
 
     def submit_remote_task(self, event_id: str, text: str, wrapper_template: str) -> None:
         self.submit_calls.append((event_id, text, wrapper_template))
+
+    def set_auto_compact(self, enabled: bool) -> None:
+        self.auto_compact_calls.append(bool(enabled))
 
     def acknowledge_result(self, event_id: str) -> None:
         self.ack_calls.append(event_id)
@@ -269,12 +278,15 @@ def test_listening_changed_calls_bridge_and_logs(qapp):
 
 
 def test_auto_compact_does_not_call_compact(qapp):
+    # monitor=None 的测试兼容：on_auto_compact 不崩，也不触发任何压缩
     fake = FakeController()
-    w = _wired(qapp, fake)
+    w = _wired(qapp, fake)  # monitor=None
     w.auto_compact_changed.emit(True)
     w.auto_compact_changed.emit(False)
-    assert fake.compact_calls == 0  # 只是切换 UI 状态，不真正压缩
-    assert "自动压缩已设置为开，后台策略将在后续阶段接入" in _log(w)
+    assert fake.compact_calls == 0  # 不触发手动压缩
+    assert fake.auto_compact_calls == []  # monitor=None → 不触发自动压缩
+    assert "自动压缩已开启" in _log(w)
+    assert "自动压缩已关闭" in _log(w)
 
 
 def test_remote_task_uses_wrapper_template(qapp):
@@ -633,3 +645,125 @@ def test_start_cliplink_poll_refreshes_first_frame(qapp, tmp_path):
     assert "15 ms" in _label(w, "a_latency")
     assert timer.isActive()
     timer.stop()
+
+
+# --- L05-06: 自动压缩接线（checkbox / compact 事件 / 手动 compact 不回归）----
+
+
+def test_ai_relay_complete_no_auto_compact(qapp):
+    # 19: AI_RELAY_COMPLETE 不 submit → 无任务 → 即使 auto_compact 开也不 compact / 不 ack
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    bridge.on_remote_task(RemoteTask("evt_c", "AI_RELAY_COMPLETE", "h", 1))
+    assert mon.submit_calls == []  # 不 submit → 无 result_complete → 无 ack
+    assert mon.ack_calls == []
+    assert fake.auto_compact_calls == []
+
+
+def test_auto_compact_checkbox_on_calls_monitor(qapp):
+    # 20: 勾选 checkbox → monitor.set_auto_compact(True) + 日志
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.auto_compact_changed.emit(True)
+    assert mon.auto_compact_calls == [True]
+    assert "自动压缩已开启" in _log(w)
+
+
+def test_auto_compact_checkbox_off_calls_monitor(qapp):
+    # 21: 取消 checkbox → monitor.set_auto_compact(False) + 日志
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.auto_compact_changed.emit(False)
+    assert mon.auto_compact_calls == [False]
+    assert "自动压缩已关闭" in _log(w)
+
+
+def test_auto_compact_checkbox_no_direct_compact(qapp):
+    # 22: checkbox signal 本身不直接调 controller.compact*（手动/自动压缩都不触发）
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.auto_compact_changed.emit(True)
+    w.auto_compact_changed.emit(False)
+    assert fake.compact_calls == 0  # 手动压缩未触发
+    assert fake.auto_compact_calls == []  # 自动压缩未直接触发（只让 monitor 入队）
+    assert mon.auto_compact_calls == [True, False]
+
+
+def test_compact_success_logs(qapp):
+    # 23: compact_success 事件 → 日志"自动任务会话压缩完成"
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "compact_success", "event_id": "evt_1"})
+    process_monitor_events(mon, w, bridge)
+    assert "自动任务会话压缩完成" in _log(w)
+
+
+def test_compact_failed_logs(qapp):
+    # 24: compact_failed 事件 → 日志"自动压缩失败：<error>"
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "compact_failed", "event_id": "evt_1", "error": "http: 500"})
+    process_monitor_events(mon, w, bridge)
+    assert "自动压缩失败：http: 500" in _log(w)
+
+
+def test_compact_failed_keeps_completed_task(qapp):
+    # 25: compact 失败 != 任务失败：不把"结果已进入回传链路"改成失败
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "result_complete", "event_id": "evt_1", "text": "R", "first_response_ms": None})
+    process_monitor_events(mon, w, bridge)
+    assert _box(w, "task_box") == "自动任务已完成，结果已进入回传链路"
+    mon.push({"type": "compact_failed", "event_id": "evt_1", "error": "http: 500"})
+    process_monitor_events(mon, w, bridge)
+    assert _box(w, "task_box") == "自动任务已完成，结果已进入回传链路"  # 文案不变
+    assert "自动压缩失败：http: 500" in _log(w)
+
+
+def test_manual_compact_still_uses_current_session(qapp):
+    # 26: 手动"立即压缩当前会话" → 仍走 compact_current_session（不回归）
+    fake = FakeController(compact=CompactResult(True, None))
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.compact_requested.emit()
+    assert fake.compact_calls == 1  # compact_current_session 被调用
+    assert fake.auto_compact_calls == []  # 不走自动压缩
+    assert "已提交当前会话压缩" in _log(w)
+
+
+def test_result_complete_order_preserved_with_auto_compact(qapp):
+    # 27: 原有顺序仍保持：bridge.deliver_result 先于 monitor.acknowledge_result
+    seq: list[str] = []
+
+    class OrderBridge(FakeBridge):
+        def deliver_result(self, text):
+            super().deliver_result(text)
+            seq.append("deliver")
+
+    class OrderMonitor(FakeMonitor):
+        def acknowledge_result(self, eid):
+            super().acknowledge_result(eid)
+            seq.append("ack")
+
+    fake = FakeController()
+    bridge = OrderBridge()
+    mon = OrderMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "result_complete", "event_id": "evt_1", "text": "R", "first_response_ms": None})
+    process_monitor_events(mon, w, bridge)
+    assert seq == ["deliver", "ack"]  # 先交 Bridge，再让 monitor 释放（compact 在 worker ack 内）

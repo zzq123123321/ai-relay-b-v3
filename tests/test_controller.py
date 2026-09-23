@@ -840,3 +840,77 @@ def test_finish_auto_task_no_task():
     ctrl = _ctrl(client, SESSION)
     assert ctrl.finish_auto_task("e1") is False
     assert ctrl._auto_task is None
+
+
+# ===================== L05-06 自动压缩冻结会话 =====================
+
+# 01. 无任务 → failure，不调用 compact_session
+def test_compact_auto_task_no_task():
+    client = FakeClient()
+    ctrl = _ctrl(client, SESSION)
+    result = ctrl.compact_auto_task("e1")
+    assert result.success is False
+    assert client.compacted == []
+
+
+# 02. event_id 不匹配 → failure，不调用 compact_session
+def test_compact_auto_task_wrong_event_id():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    result = ctrl.compact_auto_task("other_event")
+    assert result.success is False
+    assert client.compacted == []
+
+
+# 03. 任务尚未冻结 session（仍 READY，发送失败）→ failure，不调用 compact_session
+def test_compact_auto_task_no_frozen_session():
+    client = FakeClient(**ONLINE, send=SendResult(False, "offline", None))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert ctrl._auto_task.session_id is None
+    result = ctrl.compact_auto_task("e1")
+    assert result.success is False
+    assert client.compacted == []
+
+
+# 04. frozen session 正确 → compact_session(冻结 session_id, 冻结 directory)
+def test_compact_auto_task_uses_frozen_target():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)  # 冻结 ses_x / C:\work
+    result = ctrl.compact_auto_task("e1")
+    assert result.success is True
+    assert client.compacted == [("ses_x", r"C:\work")]
+
+
+# 05. active reader 已切到别的会话 → 仍用冻结 session compact（不读当前 UI 会话）
+def test_compact_auto_task_ignores_active_session_switch():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")  # 冻结 ses_x
+    other = ActiveSession(session_id="ses_other", directory=r"D:\other", source="x")
+    ctrl._read_active_session = lambda: other  # UI 已切到别的会话
+    ctrl.compact_auto_task("e1")
+    assert client.compacted == [("ses_x", r"C:\work")]  # 仍是冻结目标
+
+
+# 06. client compact success → 透传 success=True
+def test_compact_auto_task_maps_success():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), compact=CompactResult(True, None))
+    ctrl = _make_running(client)
+    assert ctrl.compact_auto_task("e1").success is True
+
+
+# 07. client compact fail → 返回 failure，且 compact_auto_task 自身不清 AutoTask
+def test_compact_auto_task_fail_keeps_task():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"),
+                        compact=CompactResult(False, "http: 404"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    result = ctrl.compact_auto_task("e1")
+    assert result.success is False
+    assert result.error == "http: 404"
+    # compact_auto_task 不 clear 任务：仍持有同一 AutoTask（释放由 finish_auto_task 负责）
+    assert ctrl._auto_task is task
+    assert task.session_id == "ses_x"
+    assert task.message_id == "m1"
+    assert task.state == AUTO_RUNNING

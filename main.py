@@ -4,7 +4,8 @@
 A端 RemoteTask 到达即交给后台 AutoMonitor（单 worker 线程）串行跑自动链的 OpenChamber
 HTTP：包装→首发送→watchdog 中断恢复→结果识别；结果确认后由 GUI 主线程交给
 ClipLinkBridge 回传，再让 controller 释放任务。Qt 主线程绝不跑 watchdog/结果轮询 HTTP。
-仍不做自动压缩 / AI_RELAY_COMPLETE。
+自动任务完成且结果已交 Bridge 后，若"自动压缩会话"开，则后台对该任务冻结的 session
+做一次 compact（失败只记日志、不阻挡回传、不影响任务释放）；AI_RELAY_COMPLETE 严格停 inbound。
 """
 
 import sys
@@ -113,7 +114,10 @@ def wire_ui(
         window.append_log("收到 A端任务，正在后台处理")
 
     def on_auto_compact(enabled: bool) -> None:
-        window.append_log("自动压缩已设置为" + ("开" if enabled else "关") + "，后台策略将在后续阶段接入")
+        # GUI 线程：只让 monitor 入队更新运行时开关（0 HTTP）；monitor=None 时不崩。
+        if monitor is not None:
+            monitor.set_auto_compact(enabled)
+        window.append_log("自动压缩已开启" if enabled else "自动压缩已关闭")
 
     bridge.on_remote_task = on_remote_task
 
@@ -220,6 +224,12 @@ def _dispatch_monitor_event(
     elif t == "result_ambiguous":
         window.set_current_task("结果识别存在冲突，已暂停自动回传")
         window.append_log("检测到同一会话存在额外用户消息，未自动回传")
+    elif t == "compact_success":
+        # compact 成功：只记日志，不改最近结果/当前任务文案，不弹 modal
+        window.append_log("自动任务会话压缩完成")
+    elif t == "compact_failed":
+        # compact 失败 != 任务失败：只记日志，不把已完成的"结果已进入回传链路"改成失败
+        window.append_log(f"自动压缩失败：{ev.get('error', '')}")
 
 
 def start_monitor_poll(
