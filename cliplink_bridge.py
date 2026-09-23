@@ -32,6 +32,8 @@ def default_status_file_path() -> Path:
 
 
 class ClipLinkBridge:
+    _STATUS_HEARTBEAT_MS = 2000
+
     def __init__(
         self,
         remote_event_path=None,
@@ -50,6 +52,7 @@ class ClipLinkBridge:
         self._model_status = "unknown"
         self._session_id: str | None = None
         self._openchamber_latency_ms: int | None = None
+        self._last_status_write_ms = 0
         self.on_remote_task = None
 
     # ── A→B inbound ──────────────────────────────────────────────
@@ -81,11 +84,12 @@ class ClipLinkBridge:
 
     def set_listening(self, enabled: bool) -> None:
         self._listening = enabled
-        self._relay_status = "listening" if enabled else "idle"
         if enabled:
             task = self._read_remote_event()
             if task:
                 self._baseline_event_id = task.event_id
+        self._refresh_relay_status()
+        self.write_status_file()
 
     def poll(self) -> RemoteTask | None:
         if not self._listening:
@@ -103,7 +107,6 @@ class ClipLinkBridge:
         return st is not None and st.status == "connected" and not is_stale(st, now_millis())
 
     def deliver_result(self, text: str) -> None:
-        self._relay_status = "wait_return"
         if self._a_available():
             try:
                 self._clipboard_writer(text)
@@ -112,6 +115,8 @@ class ClipLinkBridge:
                 self._pending_result = text
         else:
             self._pending_result = text
+        self._refresh_relay_status()
+        self.write_status_file()
 
     def flush_pending_result(self) -> None:
         if self._pending_result is None or not self._a_available():
@@ -121,15 +126,27 @@ class ClipLinkBridge:
             self._pending_result = None
         except Exception:
             pass
+        self._refresh_relay_status()
+        self.write_status_file()
 
     # ── AIRelayLite 状态文件 ─────────────────────────────────────
+
+    def _refresh_relay_status(self) -> None:
+        if self._pending_result is not None:
+            self._relay_status = "wait_return"
+        elif self._listening:
+            self._relay_status = "listening"
+        else:
+            self._relay_status = "idle"
 
     def set_model_status(self, status: str, latency_ms: int | None = None) -> None:
         self._model_status = status
         self._openchamber_latency_ms = latency_ms
+        self.write_status_file()
 
     def set_session_id(self, session_id: str | None) -> None:
         self._session_id = session_id
+        self.write_status_file()
 
     def write_status_file(self) -> None:
         data = {
@@ -149,6 +166,7 @@ class ClipLinkBridge:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(self._status_file))
+            self._last_status_write_ms = now_millis()
         except OSError:
             pass
 
@@ -159,4 +177,5 @@ class ClipLinkBridge:
         if task is not None and self.on_remote_task is not None:
             self.on_remote_task(task)
         self.flush_pending_result()
-        self.write_status_file()
+        if now_millis() - self._last_status_write_ms >= self._STATUS_HEARTBEAT_MS:
+            self.write_status_file()

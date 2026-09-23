@@ -291,7 +291,7 @@ def test_18_relay_status_transitions(tmp_path):
     assert b._relay_status == "listening"
     _make_available(tmp_path)
     b.deliver_result("x")
-    assert b._relay_status == "wait_return"
+    assert b._relay_status == "listening"  # write succeeded, pending cleared
     b.set_listening(False)
     assert b._relay_status == "idle"
 
@@ -318,6 +318,112 @@ def test_19b_disconnected_clears_latency(tmp_path):
     data = json.loads((tmp_path / "AIRelayLite" / "status.json").read_text(encoding="utf-8"))
     assert data["model_status"] == "disconnected"
     assert data["openchamber_latency_ms"] is None
+
+
+# ── FIX1: relay_status 生命周期 + status 写盘频率 ─────────────────
+
+
+def test_fix1_01_listening_true_immediate_delivery_stays_listening(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_listening(True)
+    _make_available(tmp_path)
+    b.deliver_result("r")
+    assert b._pending_result is None
+    assert b._relay_status == "listening"
+
+
+def test_fix1_02_listening_false_immediate_delivery_goes_idle(tmp_path):
+    b = _bridge(tmp_path)
+    _make_available(tmp_path)
+    b.deliver_result("r")
+    assert b._pending_result is None
+    assert b._relay_status == "idle"
+
+
+def test_fix1_03_a_offline_pending_wait_return(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_listening(True)
+    _make_unavailable(tmp_path, "offline")
+    b.deliver_result("r")
+    assert b._pending_result == "r"
+    assert b._relay_status == "wait_return"
+
+
+def test_fix1_04_stop_listening_with_pending_stays_wait_return(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_listening(True)
+    _make_unavailable(tmp_path, "offline")
+    b.deliver_result("r")
+    assert b._relay_status == "wait_return"
+    b.set_listening(False)
+    assert b._relay_status == "wait_return"
+    assert b._pending_result == "r"
+
+
+def test_fix1_05_flush_success_listening_true_restores_listening(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_listening(True)
+    _make_unavailable(tmp_path, "offline")
+    b.deliver_result("r")
+    assert b._relay_status == "wait_return"
+    _make_available(tmp_path)
+    b.flush_pending_result()
+    assert b._pending_result is None
+    assert b._relay_status == "listening"
+
+
+def test_fix1_06_flush_success_listening_false_restores_idle(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_listening(True)
+    _make_unavailable(tmp_path, "offline")
+    b.deliver_result("r")
+    b.set_listening(False)
+    assert b._relay_status == "wait_return"
+    _make_available(tmp_path)
+    b.flush_pending_result()
+    assert b._pending_result is None
+    assert b._relay_status == "idle"
+
+
+def test_fix1_07_writer_failure_pending_retained_wait_return(tmp_path):
+    writer = FakeClipboardWriter(fail=True)
+    b = _bridge(tmp_path, clipboard_writer=writer)
+    b.set_listening(True)
+    _make_available(tmp_path)
+    b.deliver_result("r")
+    assert b._pending_result == "r"
+    assert b._relay_status == "wait_return"
+
+
+def test_fix1_08_ticks_do_not_write_every_tick(tmp_path, monkeypatch):
+    b = _bridge(tmp_path)
+    fake_now = [10_000]
+    monkeypatch.setattr("cliplink_bridge.now_millis", lambda: fake_now[0])
+    b.tick()
+    assert b._last_status_write_ms == 10_000
+    fake_now[0] = 10_400
+    b.tick()
+    assert b._last_status_write_ms == 10_000
+    fake_now[0] = 10_800
+    b.tick()
+    assert b._last_status_write_ms == 10_000
+    fake_now[0] = 11_200
+    b.tick()
+    assert b._last_status_write_ms == 10_000
+
+
+def test_fix1_09_heartbeat_refreshes_at_2s(tmp_path, monkeypatch):
+    b = _bridge(tmp_path)
+    fake_now = [10_000]
+    monkeypatch.setattr("cliplink_bridge.now_millis", lambda: fake_now[0])
+    b.tick()
+    first = json.loads(b._status_file.read_text(encoding="utf-8"))["updated_at"]
+    assert first == 10_000
+    fake_now[0] = 12_000
+    b.tick()
+    second = json.loads(b._status_file.read_text(encoding="utf-8"))["updated_at"]
+    assert second == 12_000
+    assert second != first
 
 
 # ── 路径 ─────────────────────────────────────────────────────────
