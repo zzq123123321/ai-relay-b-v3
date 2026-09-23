@@ -15,7 +15,7 @@
 
 from active_session_reader import ActiveSession
 from controller import LiteController
-from openchamber_client import CompactResult, SendResult
+from openchamber_client import CompactResult, ExecutionConfig, ProbeResult, SendResult
 
 
 class FakeClient:
@@ -24,17 +24,31 @@ class FakeClient:
         validate=True,
         send=None,
         compact=None,
+        probe_connected=True,
+        latency_ms=1,
+        config=None,
     ) -> None:
         self.validate_result = validate
         self.send_result = send if send is not None else SendResult(True, None, "msg_1")
         self.compact_result = compact if compact is not None else CompactResult(True, None)
+        self.probe_connected = probe_connected
+        self.latency_ms = latency_ms
+        self.config = config  # ExecutionConfig 或 None
         self.validated = []
         self.sent = []
         self.compacted = []
+        self.resolved = []
 
     def validate_session(self, session_id, directory=None):
         self.validated.append((session_id, directory))
         return self.validate_result
+
+    def probe(self):
+        return ProbeResult(self.probe_connected, self.latency_ms, None if self.probe_connected else "timeout")
+
+    def resolve_execution_config(self, session_id, directory=None):
+        self.resolved.append((session_id, directory))
+        return self.config
 
     def send_text(self, session_id, directory, text):
         self.sent.append((session_id, directory, text))
@@ -151,3 +165,126 @@ def test_compact_maps_error():
     result = _ctrl(client, SESSION).compact_current_session()
     assert result.success is False
     assert result.error == "http: 404"
+
+
+# ============================ L05-01 自动任务链 =============================
+
+CFG = ExecutionConfig(agent="build", provider_id="prov", model_id="mod", variant=None, source="assistant")
+
+
+# --- 包装规则（纯函数） ---
+def test_wrap_empty_returns_raw():
+    assert LiteController.wrap_auto_content("  原始  ", "") == "  原始  "
+
+
+def test_wrap_placeholder_replaces():
+    assert LiteController.wrap_auto_content("A", "X{content}Y") == "XAY"
+
+
+def test_wrap_multiple_placeholder_all_replaced():
+    assert LiteController.wrap_auto_content("AB", "{content}-{content}") == "AB-AB"
+
+
+def test_wrap_no_placeholder_appends_newline():
+    assert LiteController.wrap_auto_content("R", "W") == "W\nR"
+
+
+def test_wrap_preserves_raw_exactly():
+    raw = "中文\n换行\t制表"
+    assert LiteController.wrap_auto_content(raw, "前{content}后") == "前中文\n换行\t制表后"
+
+
+# --- 模型离线：包装已固化，send_text=0 ---
+def test_receive_model_offline_wraps_and_waits():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    intake = ctrl.receive_auto_task("e1", "RAW", "W{content}")
+    assert intake.accepted is True
+    assert intake.submitted is False
+    assert client.sent == []  # 0 次 POST
+    assert ctrl._auto_task.wrapped_text == "WRAW"
+    assert ctrl._auto_task.state == "ready_to_send"
+
+
+# --- 服务在线但无 session/config：READY，send=0 ---
+def test_receive_online_no_config_waits():
+    client = FakeClient(probe_connected=True, config=None)
+    ctrl = _ctrl(client, SESSION)
+    intake = ctrl.receive_auto_task("e1", "RAW", "")
+    assert intake.accepted is True
+    assert intake.submitted is False
+    assert client.sent == []
+    assert ctrl._auto_task.state == "ready_to_send"
+    assert ctrl._auto_task.wrapped_text == "RAW"
+
+
+# --- 模型 ready：发送 wrapped，accepted → RUNNING ---
+def test_receive_model_ready_sends_wrapped():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(True, None, "m_ok"))
+    ctrl = _ctrl(client, SESSION)
+    intake = ctrl.receive_auto_task("e1", "RAW", "W{content}")
+    assert intake.accepted is True
+    assert intake.submitted is True
+    assert client.sent == [("ses_x", r"C:\work", "WRAW")]
+    assert ctrl._auto_task.state == "running"
+    assert ctrl._auto_task.message_id == "m_ok"
+    assert ctrl._auto_task.error is None
+
+
+# --- 模板事后被改：try_send 仍发旧的已保存 wrapped ---
+def test_try_send_uses_saved_wrapped_not_current_template():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "OLD{content}")  # 离线 → wrapped="OLDRAW"
+    assert client.sent == []
+    client.probe_connected = True
+    client.send_result = SendResult(True, None, "m2")
+    ctrl.try_send_pending_auto_task()
+    assert client.sent == [("ses_x", r"C:\work", "OLDRAW")]
+
+
+# --- RUNNING 后再 try_send：0 次新增 POST ---
+def test_running_resend_no_extra_post():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(True, None, "m1"))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")  # → RUNNING
+    assert ctrl._auto_task.state == "running"
+    before = len(client.sent)
+    ctrl.try_send_pending_auto_task()
+    assert len(client.sent) == before
+
+
+# --- 发送失败：保持 READY，error 保存 ---
+def test_send_failure_stays_ready_with_error():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(False, "http: 500", None))
+    ctrl = _ctrl(client, SESSION)
+    intake = ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert intake.accepted is True
+    assert intake.submitted is False
+    assert ctrl._auto_task.state == "ready_to_send"
+    assert ctrl._auto_task.error == "http: 500"
+    assert client.sent == [("ses_x", r"C:\work", "RAW")]
+
+
+# --- READY 时来新任务：busy，原任务不覆盖 ---
+def test_new_task_while_ready_is_busy():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW1", "{content}")
+    assert ctrl._auto_task.state == "ready_to_send"
+    intake2 = ctrl.receive_auto_task("e2", "RAW2", "{content}")
+    assert intake2.accepted is False
+    assert ctrl._auto_task.event_id == "e1"
+    assert ctrl._auto_task.wrapped_text == "RAW1"
+    assert client.sent == []
+
+
+# --- RUNNING 时来新任务：busy ---
+def test_new_task_while_running_is_busy():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(True, None, "m1"))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW1", "{content}")  # → RUNNING
+    intake2 = ctrl.receive_auto_task("e2", "RAW2", "{content}")
+    assert intake2.accepted is False
+    assert ctrl._auto_task.event_id == "e1"
+    assert ctrl._auto_task.wrapped_text == "RAW1"

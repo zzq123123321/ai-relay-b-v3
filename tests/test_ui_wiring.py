@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
 from cliplink_bridge import ClipLinkBridge, RemoteTask
 from cliplink_status import now_millis
-from controller import CurrentSession, LiteController, ModelConnectionResult
+from controller import AutoTaskIntake, CurrentSession, LiteController, ModelConnectionResult
 from main import apply_cliplink_status, start_bridge_poll, start_cliplink_poll, wire_ui
 from openchamber_client import CompactResult, SendResult
 from ui.main_window import MainWindow
@@ -38,15 +38,17 @@ from ui.main_window import MainWindow
 class FakeController:
     """LiteController 的替身：记录调用、按预设返回，绝不起真实 HTTP。"""
 
-    def __init__(self, session=None, model_result=None, send=None, compact=None) -> None:
+    def __init__(self, session=None, model_result=None, send=None, compact=None, auto=None) -> None:
         self._session = session if session is not None else CurrentSession(None, None, None, False, "当前激活会话不可用")
         self._model = model_result if model_result is not None else ModelConnectionResult(False, None, False, "timeout")
         self._send = send if send is not None else SendResult(True, None, "msg_1")
         self._compact = compact if compact is not None else CompactResult(True, None)
+        self._auto = auto  # 预设 AutoTaskIntake；None 时按 model 推导
         self.refresh_calls = 0
         self.model_calls = 0
         self.sent_texts = []
         self.compact_calls = 0
+        self.auto_intakes: list[tuple[str, str, str]] = []
 
     def get_current_session(self):
         self.refresh_calls += 1
@@ -63,6 +65,15 @@ class FakeController:
     def compact_current_session(self):
         self.compact_calls += 1
         return self._compact
+
+    def receive_auto_task(self, event_id, raw_text, wrapper_template):
+        self.auto_intakes.append((event_id, raw_text, wrapper_template))
+        if self._auto is not None:
+            return self._auto
+        # 默认：模型 ready 则视为已提交，否则仅包装等待
+        if self._model.connected and self._model.ready:
+            return AutoTaskIntake(True, True)
+        return AutoTaskIntake(True, False)
 
 
 class FakeBridge:
@@ -219,17 +230,57 @@ def test_auto_compact_does_not_call_compact(qapp):
     assert "自动压缩已设置为开，后台策略将在后续阶段接入" in _log(w)
 
 
-def test_remote_task_updates_ui_without_model(qapp):
+def test_remote_task_uses_wrapper_template(qapp):
+    # 14: on_remote_task 通过 window.wrapper_template() 读取模板传给 controller
     fake = FakeController()
     bridge = FakeBridge()
     w = _wired(qapp, fake, bridge)
-    w.listening_changed.emit(True)
-    task = RemoteTask("evt_new", "A端任务内容", "hash1", 12345)
-    bridge.on_remote_task(task)
-    assert _box(w, "task_box") == "已收到A端任务，等待自动处理"
-    assert "收到 A端新任务" in _log(w)
-    assert fake.sent_texts == []
-    assert fake.compact_calls == 0
+    w._wrapper_template = "前{content}后"
+    bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert fake.auto_intakes == [("evt_new", "A端任务内容", "前{content}后")]
+
+
+def test_remote_task_ready_ui(qapp):
+    # 15: 模型不可用 → 已包装等待文案
+    fake = FakeController()  # 默认模型 disconnected
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert _box(w, "task_box") == "已包装，等待大模型恢复"
+    assert "收到 A端新任务，已完成包装，等待大模型" in _log(w)
+    assert fake.auto_intakes == [("evt_new", "A端任务内容", "{content}")]
+
+
+def test_remote_task_running_ui(qapp):
+    # 16: 模型 ready → 已提交文案
+    fake = FakeController(model_result=ModelConnectionResult(True, 12, True, None))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert _box(w, "task_box") == "已提交到大模型，等待执行"
+    assert "收到 A端新任务，已包装并提交到当前会话" in _log(w)
+
+
+def test_remote_task_busy_logs(qapp):
+    # busy：controller 返回 accepted=False → 记日志，不改当前任务框
+    fake = FakeController(auto=AutoTaskIntake(False, False))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.set_current_task("已提交到大模型，等待执行")
+    bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert "自动任务未接收：已有任务正在处理" in _log(w)
+    assert _box(w, "task_box") == "已提交到大模型，等待执行"
+
+
+def test_remote_task_independent_of_a_connection(qapp):
+    # 17: A端断连也不影响包装/发送（bridge 未连接 A 仍照常 intake）
+    fake = FakeController(model_result=ModelConnectionResult(True, 12, True, None))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.set_a_connection("已断开", "--", None)  # A 端不可用
+    bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert fake.auto_intakes == [("evt_new", "A端任务内容", "{content}")]
+    assert _box(w, "task_box") == "已提交到大模型，等待执行"
 
 
 def test_refresh_session_calls_bridge_set_session_id(qapp):

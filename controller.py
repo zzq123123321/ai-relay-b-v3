@@ -15,6 +15,11 @@ from openchamber_client import CompactResult, OpenChamberClient, SendResult
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:57123"
 
+# 自动任务最小状态机：只有三态，无历史、无 OperationId、无队列。
+AUTO_IDLE = "idle"
+AUTO_READY = "ready_to_send"
+AUTO_RUNNING = "running"
+
 
 @dataclass(frozen=True, slots=True)
 class CurrentSession:
@@ -43,6 +48,29 @@ class ModelConnectionResult:
     error: str | None
 
 
+@dataclass
+class AutoTask:
+    """单任务自动链最小状态：只有 IDLE/READY_TO_SEND/RUNNING，可就地改 state。
+
+    包装在任务到达时一次性完成并固化到 wrapped_text；模型恢复/重试只重发
+    这个已保存的 wrapped_text，绝不重新读取包装模板、重新包装 raw text。
+    """
+
+    event_id: str
+    wrapped_text: str
+    state: str = AUTO_IDLE
+    message_id: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AutoTaskIntake:
+    """receive_auto_task 的稳定返回：accepted=是否接收(非 busy)，submitted=是否已提交(→RUNNING)。"""
+
+    accepted: bool
+    submitted: bool
+
+
 class LiteController:
     def __init__(
         self,
@@ -55,6 +83,59 @@ class LiteController:
         self._read_active_session = (
             active_session_reader if active_session_reader is not None else read_active_session
         )
+        self._auto_task: AutoTask | None = None
+
+    # ------------------------------------------------------------- 自动任务链
+    @staticmethod
+    def wrap_auto_content(raw_text: str, wrapper_template: str) -> str:
+        """把 raw_text 套进 wrapper_template：空模板原样；含 {content} 全替换；否则模板+换行+原文。
+
+        严格不改写 raw_text（不 strip、不换行、不追加系统提示）。
+        """
+        if wrapper_template == "":
+            return raw_text
+        if "{content}" in wrapper_template:
+            return wrapper_template.replace("{content}", raw_text)
+        return wrapper_template + "\n" + raw_text
+
+    def receive_auto_task(self, event_id: str, raw_text: str, wrapper_template: str) -> AutoTaskIntake:
+        """A端 RemoteTask 入口：立即包装固化 → READY_TO_SEND → 单次尝试发送。
+
+        包装与模型/OpenChamber/A端连接是否在线完全无关：到达即固化 wrapped_text。
+        已有 READY_TO_SEND 或 RUNNING 任务时返回 busy，不覆盖、不重发。
+        """
+        if self._auto_task is not None and self._auto_task.state in (AUTO_READY, AUTO_RUNNING):
+            return AutoTaskIntake(False, False)
+        self._auto_task = AutoTask(
+            event_id=event_id,
+            wrapped_text=self.wrap_auto_content(raw_text, wrapper_template),
+            state=AUTO_READY,
+        )
+        self.try_send_pending_auto_task()
+        return AutoTaskIntake(True, self._auto_task.state == AUTO_RUNNING)
+
+    def try_send_pending_auto_task(self) -> None:
+        """仅处理 READY_TO_SEND：先探模型可用，再对已保存的 wrapped_text 发一次。
+
+        模型不可用 → 保持 READY_TO_SEND（由 L05-02 watchdog 恢复时再调）。
+        RUNNING 再调 → 0 次 POST（原任务不重发）。
+        """
+        task = self._auto_task
+        if task is None or task.state != AUTO_READY:
+            return
+        conn = self.test_model_connection()
+        if not (conn.connected and conn.ready):
+            return
+        session = self._current_session()
+        if not session.valid:
+            return
+        result = self._client.send_text(session.session_id, session.directory, task.wrapped_text)
+        if result.accepted:
+            task.state = AUTO_RUNNING
+            task.message_id = result.message_id
+            task.error = None
+        else:
+            task.error = result.error
 
     def _current_session(self) -> CurrentSession:
         session = self._read_active_session()

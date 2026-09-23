@@ -382,6 +382,10 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------- 下一轮接线用的简单 setter
+    def wrapper_template(self) -> str:
+        """当前 A端自动任务包装模板（内存值）。供 main 层读取，不直接访问 _wrapper_template。"""
+        return self._wrapper_template
+
     def set_a_connection(self, status: str = "未连接", peer: str = "--", latency_ms=None) -> None:
         self._a_status.setText("● " + status)
         self._a_status.setStyleSheet(f"font-weight:bold;color:{_status_color(status)};")

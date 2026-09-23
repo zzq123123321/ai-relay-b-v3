@@ -1,7 +1,8 @@
 """AI Relay B Lite 应用入口：QApplication → MainWindow → LiteController + ClipLinkBridge → wire_ui → show。
 
 本轮把 UI 的 signal 接到 LiteController（全 fake 可测）+ ClipLinkBridge（A→B 事件读取、
-B→A 结果回传、AIRelayLite 状态文件）。仍不做自动包装 / 自动发模型 / 自动压缩 / watchdog。
+B→A 结果回传、AIRelayLite 状态文件），并把 A端 RemoteTask 接到自动任务链（立即包装 +
+首次自动发送）。仍不做模型 watchdog / 自动压缩 / 中断续接 / AI_RELAY_COMPLETE。
 """
 
 import sys
@@ -18,8 +19,8 @@ from ui.main_window import MainWindow
 def wire_ui(window: MainWindow, controller: LiteController, bridge: ClipLinkBridge) -> None:
     """把 MainWindow 的 signal 接到 LiteController + ClipLinkBridge。
 
-    全部是用户主动触发的本机同步操作 + ClipLink 事件桥接线，本轮不引入线程框架；
-    自动包装 / 模型发送 / 自动压缩 / watchdog 统一留给后续 monitor。
+    全部是用户主动触发的本机同步操作 + ClipLink 事件桥接线 + A端 RemoteTask 自动任务链
+    （立即包装 + 首次发送），本轮不引入线程框架；模型 watchdog / 自动压缩留给后续 monitor。
     """
 
     def on_refresh_session() -> None:
@@ -68,8 +69,17 @@ def wire_ui(window: MainWindow, controller: LiteController, bridge: ClipLinkBrid
         window.append_log("自动监听已开始" if enabled else "自动监听已停止")
 
     def on_remote_task(task) -> None:
-        window.set_current_task("已收到A端任务，等待自动处理")
-        window.append_log("收到 A端新任务")
+        # A端任务到达 → 读当前包装模板 → 交给 controller 立即包装并尝试首发送。
+        # 不再检查 A端是否仍连接：包装与发送只依赖模型可用性，A端只影响最终回传。
+        intake = controller.receive_auto_task(task.event_id, task.text, window.wrapper_template())
+        if not intake.accepted:
+            window.append_log("自动任务未接收：已有任务正在处理")
+        elif intake.submitted:
+            window.set_current_task("已提交到大模型，等待执行")
+            window.append_log("收到 A端新任务，已包装并提交到当前会话")
+        else:
+            window.set_current_task("已包装，等待大模型恢复")
+            window.append_log("收到 A端新任务，已完成包装，等待大模型")
 
     def on_auto_compact(enabled: bool) -> None:
         window.append_log("自动压缩已设置为" + ("开" if enabled else "关") + "，后台策略将在后续阶段接入")
