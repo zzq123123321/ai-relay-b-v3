@@ -198,6 +198,21 @@ class LiteController:
             task.session_id, task.directory, task.message_id, allowed
         )
 
+    def finish_auto_task(self, event_id: str) -> bool:
+        """释放当前自动任务。只能在"最终结果已交给 ClipLinkBridge"之后调用：
+        无论 Bridge 是直接回传还是因 A 离线把结果存成 pending_result，都算已接管结果。
+
+        当前无任务 → False；event_id 不匹配当前任务 → False（绝不清错任务）；
+        匹配 → 清 _auto_task → True。
+        """
+        task = self._auto_task
+        if task is None:
+            return False
+        if task.event_id != event_id:
+            return False
+        self._auto_task = None
+        return True
+
     # ------------------------------------------------------------- 模型 watchdog
     def watchdog_tick(self, now_ms: int | None = None) -> WatchdogTick:
         """纯控制入口：推进自动任务中断恢复状态机，本轮由测试/后续 worker 调用。
@@ -256,6 +271,30 @@ class LiteController:
                 # 仍 idle 且无变化 → 保持 RESUME_SENT，不重复发续接
 
         return WatchdogTick(prev, task.state, action, task.error)
+
+    def begin_interrupted_recovery(self, now_ms: int | None = None) -> bool:
+        """interrupted 结果（服务在线但本次执行已 settled/中断、无安全最终答案）→
+        用当前任务已冻结的 session_id/directory/message_id 读一次 progress 建立恢复基线。
+
+        只允许 RUNNING / RESUME_SENT 进入；成功 → 进入 RECOVER_CHECK（复用 watchdog
+        "观察 5s → 自行恢复不发 / 无进展才 resume 一次"），并保留全部 resume_message_ids。
+        读取失败 → 返回 False、不发 resume、不把读取失败当成"无进展"，由后台下一轮再试。
+        """
+        task = self._auto_task
+        if task is None or task.state not in (AUTO_RUNNING, AUTO_RESUME_SENT):
+            return False
+        if task.message_id is None:
+            return False
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        prog = self._client.get_task_progress(task.session_id, task.directory, task.message_id)
+        if not prog.read_ok:
+            return False
+        task.recover_baseline = prog.marker
+        task.recover_started_ms = now_ms
+        task.resume_attempted = False
+        task.state = AUTO_RECOVER_CHECK
+        return True
 
     def _observed_progress(self, task) -> bool:
         """status busy/retry 或 progress marker 相对基线已变化 → 视为已自行恢复。

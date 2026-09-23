@@ -30,7 +30,14 @@ from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 from cliplink_bridge import ClipLinkBridge, RemoteTask
 from cliplink_status import now_millis
 from controller import AutoTaskIntake, CurrentSession, LiteController, ModelConnectionResult
-from main import apply_cliplink_status, start_bridge_poll, start_cliplink_poll, wire_ui
+from main import (
+    apply_cliplink_status,
+    process_monitor_events,
+    start_bridge_poll,
+    start_cliplink_poll,
+    start_monitor_poll,
+    wire_ui,
+)
 from openchamber_client import CompactResult, SendResult
 from ui.main_window import MainWindow
 
@@ -83,6 +90,7 @@ class FakeBridge:
         self.listening_calls: list[bool] = []
         self.session_ids: list[str | None] = []
         self.model_statuses: list[tuple] = []
+        self.delivered: list[str] = []
         self.on_remote_task = None
 
     def set_listening(self, enabled: bool) -> None:
@@ -94,8 +102,34 @@ class FakeBridge:
     def set_model_status(self, status: str, latency_ms: int | None = None) -> None:
         self.model_statuses.append((status, latency_ms))
 
+    def deliver_result(self, text: str) -> None:
+        self.delivered.append(text)
+
     def tick(self) -> None:
         pass
+
+
+class FakeMonitor:
+    """AutoMonitor 替身：记录 submit/ack，可手动 push 事件供 process_monitor_events drain。"""
+
+    def __init__(self) -> None:
+        self.submit_calls: list[tuple[str, str, str]] = []
+        self.ack_calls: list[str] = []
+        self._events: list[dict] = []
+
+    def submit_remote_task(self, event_id: str, text: str, wrapper_template: str) -> None:
+        self.submit_calls.append((event_id, text, wrapper_template))
+
+    def acknowledge_result(self, event_id: str) -> None:
+        self.ack_calls.append(event_id)
+
+    def drain_events(self) -> list[dict]:
+        out = self._events
+        self._events = []
+        return out
+
+    def push(self, ev: dict) -> None:
+        self._events.append(ev)
 
 
 @pytest.fixture(scope="module")
@@ -104,10 +138,10 @@ def qapp():
     yield app
 
 
-def _wired(qapp, controller, bridge=None):
+def _wired(qapp, controller, bridge=None, monitor=None):
     w = MainWindow()
     w.show()
-    wire_ui(w, controller, bridge if bridge is not None else FakeBridge())
+    wire_ui(w, controller, bridge if bridge is not None else FakeBridge(), monitor)
     return w
 
 
@@ -231,56 +265,158 @@ def test_auto_compact_does_not_call_compact(qapp):
 
 
 def test_remote_task_uses_wrapper_template(qapp):
-    # 14: on_remote_task 通过 window.wrapper_template() 读取模板传给 controller
+    # 17: on_remote_task 只 submit 给 monitor（读 window.wrapper_template()），
+    # 不再直接调 controller.receive_auto_task；主线程立即显示"正在处理"（0 HTTP）
     fake = FakeController()
     bridge = FakeBridge()
-    w = _wired(qapp, fake, bridge)
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
     w._wrapper_template = "前{content}后"
     bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
-    assert fake.auto_intakes == [("evt_new", "A端任务内容", "前{content}后")]
+    assert mon.submit_calls == [("evt_new", "A端任务内容", "前{content}后")]
+    assert fake.auto_intakes == []  # 主线程不再直接调 controller
+    assert _box(w, "task_box") == "已收到A端任务，正在处理"
 
 
 def test_remote_task_ready_ui(qapp):
-    # 15: 模型不可用 → 已包装等待文案
-    fake = FakeController()  # 默认模型 disconnected
+    # 18: 主线程立即"正在处理"；monitor 回 intake_ready → "已包装，等待大模型恢复"
+    fake = FakeController()
     bridge = FakeBridge()
-    w = _wired(qapp, fake, bridge)
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
     bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert _box(w, "task_box") == "已收到A端任务，正在处理"
+    mon.push({"type": "intake_ready"})
+    process_monitor_events(mon, w, bridge)
     assert _box(w, "task_box") == "已包装，等待大模型恢复"
     assert "收到 A端新任务，已完成包装，等待大模型" in _log(w)
-    assert fake.auto_intakes == [("evt_new", "A端任务内容", "{content}")]
 
 
 def test_remote_task_running_ui(qapp):
-    # 16: 模型 ready → 已提交文案
-    fake = FakeController(model_result=ModelConnectionResult(True, 12, True, None))
+    # 19: monitor 回 intake_running → "已提交到大模型，等待执行"
+    fake = FakeController()
     bridge = FakeBridge()
-    w = _wired(qapp, fake, bridge)
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
     bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    mon.push({"type": "intake_running"})
+    process_monitor_events(mon, w, bridge)
     assert _box(w, "task_box") == "已提交到大模型，等待执行"
     assert "收到 A端新任务，已包装并提交到当前会话" in _log(w)
 
 
 def test_remote_task_busy_logs(qapp):
-    # busy：controller 返回 accepted=False → 记日志，不改当前任务框
-    fake = FakeController(auto=AutoTaskIntake(False, False))
+    # 20: intake_busy → 只记日志，不改当前任务框（保持 on_remote_task 的立即文案）
+    fake = FakeController()
     bridge = FakeBridge()
-    w = _wired(qapp, fake, bridge)
-    w.set_current_task("已提交到大模型，等待执行")
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
     bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
+    assert _box(w, "task_box") == "已收到A端任务，正在处理"
+    mon.push({"type": "intake_busy"})
+    process_monitor_events(mon, w, bridge)
     assert "自动任务未接收：已有任务正在处理" in _log(w)
-    assert _box(w, "task_box") == "已提交到大模型，等待执行"
+    assert _box(w, "task_box") == "已收到A端任务，正在处理"  # busy 不改任务框
 
 
 def test_remote_task_independent_of_a_connection(qapp):
-    # 17: A端断连也不影响包装/发送（bridge 未连接 A 仍照常 intake）
-    fake = FakeController(model_result=ModelConnectionResult(True, 12, True, None))
+    # 21: A端断连也不影响 submit（A 端只影响最终回传，不影响包装/发送）
+    fake = FakeController()
     bridge = FakeBridge()
-    w = _wired(qapp, fake, bridge)
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
     w.set_a_connection("已断开", "--", None)  # A 端不可用
     bridge.on_remote_task(RemoteTask("evt_new", "A端任务内容", "hash1", 12345))
-    assert fake.auto_intakes == [("evt_new", "A端任务内容", "{content}")]
+    assert mon.submit_calls == [("evt_new", "A端任务内容", "{content}")]
+    mon.push({"type": "intake_running"})
+    process_monitor_events(mon, w, bridge)
     assert _box(w, "task_box") == "已提交到大模型，等待执行"
+
+
+# --- 自动任务最终结果 / 首响应 的 UI 回传接线（monitor 事件驱动）-----------
+
+
+def test_result_complete_deliver_before_ack(qapp):
+    # 22: result_complete 时 bridge.deliver_result 必须先于 monitor.acknowledge_result
+    seq: list[str] = []
+
+    class OrderBridge(FakeBridge):
+        def deliver_result(self, text):
+            super().deliver_result(text)
+            seq.append("deliver")
+
+    class OrderMonitor(FakeMonitor):
+        def acknowledge_result(self, eid):
+            super().acknowledge_result(eid)
+            seq.append("ack")
+
+    fake = FakeController()
+    bridge = OrderBridge()
+    mon = OrderMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "result_complete", "event_id": "evt_1", "text": "R", "first_response_ms": None})
+    process_monitor_events(mon, w, bridge)
+    assert seq == ["deliver", "ack"]  # 先交 Bridge，再让 monitor 释放 Controller 任务
+
+
+def test_result_complete_updates_recent_result(qapp):
+    # 23: result_complete → 更新最近结果 + 任务文案 + 交 Bridge + ack
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    assert _box(w, "result_box") == "暂无结果"
+    mon.push({"type": "result_complete", "event_id": "evt_1", "text": "最终答案", "first_response_ms": None})
+    process_monitor_events(mon, w, bridge)
+    assert _box(w, "result_box") == "最终答案"
+    assert _box(w, "task_box") == "自动任务已完成，结果已进入回传链路"
+    assert "大模型任务完成" in _log(w)
+    assert bridge.delivered == ["最终答案"]
+    assert mon.ack_calls == ["evt_1"]
+
+
+def test_result_ambiguous_pauses_ui(qapp):
+    # 24: result_ambiguous → 暂停自动回传文案 + 日志，不清任务、不交 Bridge
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "result_ambiguous", "event_id": "evt_1"})
+    process_monitor_events(mon, w, bridge)
+    assert _box(w, "task_box") == "结果识别存在冲突，已暂停自动回传"
+    assert "检测到同一会话存在额外用户消息，未自动回传" in _log(w)
+    assert bridge.delivered == []  # ambiguous 绝不回传
+    assert mon.ack_calls == []  # 不释放任务
+
+
+def test_first_response_preserves_oc_latency(qapp):
+    # 25: 首响应 UI 更新时保留已有 OC 服务延迟（不被清成 --）
+    fake = FakeController(model_result=ModelConnectionResult(True, 15, True, None))
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.test_model_requested.emit()  # status=正常, OC 服务延迟=15ms
+    assert "15 ms" in _label(w, "llm_oc")
+    mon.push({"type": "first_response", "first_response_ms": 420})
+    process_monitor_events(mon, w, bridge)
+    assert "15 ms" in _label(w, "llm_oc")  # OC 延迟保留
+    assert "420 ms" in _label(w, "llm_first")  # 首响应已显示
+
+
+def test_monitor_poll_timer_does_no_http(qapp):
+    # 26: monitor 事件处理路径（QTimer 调用的同一函数）不做 OpenChamber HTTP
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    timer = start_monitor_poll(w, mon, bridge, interval_ms=60_000)  # 长间隔，测试期间不触发
+    assert timer.isActive()
+    mon.push({"type": "offline"})
+    process_monitor_events(mon, w, bridge)  # 走 QTimer 的同一处理路径
+    assert fake.model_calls == 0  # drain/处理事件绝不发 OpenChamber HTTP
+    assert _box(w, "task_box") == "大模型连接中断，等待恢复"
+    assert bridge.model_statuses == [("disconnected", None)]
+    timer.stop()
 
 
 def test_refresh_session_calls_bridge_set_session_id(qapp):

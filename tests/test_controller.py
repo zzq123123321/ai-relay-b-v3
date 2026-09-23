@@ -758,3 +758,85 @@ def test_inspect_allows_all_resume_ids():
     task.resume_message_ids = {"U1", "U2", "U3"}  # 模拟经历多次中断续接
     ctrl.inspect_auto_task_result()
     assert client.result_calls == [("ses_x", r"C:\work", "m1", {"U1", "U2", "U3"})]
+
+
+# ===================== L05-04：interrupted 恢复 + 安全释放任务 =====================
+
+# 3. interrupted + progress 基线读取成功 → RECOVER_CHECK（保留冻结目标/message_id）
+def test_interrupted_recovery_from_running():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert task.state == AUTO_RUNNING
+    ok = ctrl.begin_interrupted_recovery(now_ms=1000)
+    assert ok is True
+    assert task.state == AUTO_RECOVER_CHECK
+    assert task.recover_baseline == "marker0"  # 默认 progress marker
+    assert task.recover_started_ms == 1000
+    assert task.resume_attempted is False
+    assert task.message_id == "m1"  # 冻结目标不变
+
+
+# 4. interrupted baseline 读取失败 → 不发 resume、状态不变、返回 False
+def test_interrupted_recovery_progress_read_failure():
+    client = FakeClient(
+        **ONLINE, send=SendResult(True, None, "m1"),
+        progress=TaskProgressResult(False, "marker0", False),  # read_ok=False
+    )
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    ok = ctrl.begin_interrupted_recovery(now_ms=1000)
+    assert ok is False
+    assert task.state == AUTO_RUNNING  # 未进入 RECOVER_CHECK
+    assert task.recover_baseline is None
+    assert len(client.sent) == 1  # 只有首次 wrapped，没发 resume
+
+
+# 5. interrupted recovery 保留全部 resume_message_ids（历史不丢）
+def test_interrupted_recovery_preserves_resume_ids():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RESUME_SENT
+    task.resume_message_ids = {"U1", "U2"}  # 经历两次续接的历史
+    ok = ctrl.begin_interrupted_recovery(now_ms=1000)
+    assert ok is True
+    assert task.state == AUTO_RECOVER_CHECK
+    assert task.resume_message_ids == {"U1", "U2"}
+
+
+# 非 RUNNING/RESUME_SENT 状态不允许进入（已在恢复中 / 无任务态）
+def test_interrupted_recovery_rejects_other_states():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    assert ctrl.begin_interrupted_recovery(now_ms=1000) is False
+    task.state = AUTO_IDLE
+    assert ctrl.begin_interrupted_recovery(now_ms=1000) is False
+
+
+# 1. finish_auto_task 正确 event_id → 清任务
+def test_finish_auto_task_correct_event_id():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    assert ctrl._auto_task is not None
+    assert ctrl.finish_auto_task("e1") is True
+    assert ctrl._auto_task is None
+
+
+# 2. finish_auto_task 错 event_id → 绝不清任务
+def test_finish_auto_task_wrong_event_id_keeps_task():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert ctrl.finish_auto_task("other_event") is False
+    assert ctrl._auto_task is task  # 未清
+
+
+# 当前无任务 → False
+def test_finish_auto_task_no_task():
+    client = FakeClient()
+    ctrl = _ctrl(client, SESSION)
+    assert ctrl.finish_auto_task("e1") is False
+    assert ctrl._auto_task is None
