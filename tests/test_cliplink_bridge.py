@@ -320,6 +320,24 @@ def test_19b_disconnected_clears_latency(tmp_path):
     assert data["openchamber_latency_ms"] is None
 
 
+# ── L05-05: 真实模型首响应写状态文件 ────────────────────────────────
+
+
+def test_l0505_model_first_response_int_written(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_model_first_response(820)
+    data = json.loads((tmp_path / "AIRelayLite" / "status.json").read_text(encoding="utf-8"))
+    assert data["model_first_response_ms"] == 820
+
+
+def test_l0505_model_first_response_none_writes_null(tmp_path):
+    b = _bridge(tmp_path)
+    b.set_model_first_response(820)
+    b.set_model_first_response(None)
+    data = json.loads((tmp_path / "AIRelayLite" / "status.json").read_text(encoding="utf-8"))
+    assert data["model_first_response_ms"] is None
+
+
 # ── FIX1: relay_status 生命周期 + status 写盘频率 ─────────────────
 
 

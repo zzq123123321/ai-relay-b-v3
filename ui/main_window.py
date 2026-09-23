@@ -351,10 +351,19 @@ class MainWindow(QMainWindow):
         """
         self.manual_send_requested.emit(self._manual_edit.toPlainText())
 
+    def set_listening(self, enabled: bool, emit: bool = True) -> None:
+        """公开监听开关：统一维护 _listening / 按钮文字 / listening_changed。
+
+        enabled=True → 按钮“停止监听”；enabled=False → “开始监听”。
+        emit=True 时发 listening_changed（现有接线会继续调 bridge.set_listening）。
+        """
+        self._listening = enabled
+        self._btn_listen.setText("停止监听" if enabled else "开始监听")
+        if emit:
+            self.listening_changed.emit(enabled)
+
     def _toggle_listening(self) -> None:
-        self._listening = not self._listening
-        self._btn_listen.setText("停止监听" if self._listening else "开始监听")
-        self.listening_changed.emit(self._listening)
+        self.set_listening(not self._listening)
 
     def _open_wrapper(self) -> None:
         self._wrapper_dialog.show()

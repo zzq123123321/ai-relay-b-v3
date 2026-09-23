@@ -141,6 +141,25 @@ def test_listening_toggle(win):
     assert fired == [True, False]
 
 
+def test_set_listening_true(win):
+    fired = []
+    win.listening_changed.connect(fired.append)
+    win.set_listening(True)
+    assert win._listening is True
+    assert win.findChild(QPushButton, "btn_listen").text() == "停止监听"
+    assert fired == [True]
+
+
+def test_set_listening_false(win):
+    win.set_listening(True)
+    fired = []
+    win.listening_changed.connect(fired.append)
+    win.set_listening(False)
+    assert win._listening is False
+    assert win.findChild(QPushButton, "btn_listen").text() == "开始监听"
+    assert fired == [False]
+
+
 def test_wrapper_dialog_opens(win):
     dlg = win.findChild(QDialog, "wrapper_dialog")
     assert isinstance(dlg, WrapperDialog)

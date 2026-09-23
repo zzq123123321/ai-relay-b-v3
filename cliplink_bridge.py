@@ -52,6 +52,7 @@ class ClipLinkBridge:
         self._model_status = "unknown"
         self._session_id: str | None = None
         self._openchamber_latency_ms: int | None = None
+        self._model_first_response_ms: int | None = None
         self._last_status_write_ms = 0
         self.on_remote_task = None
 
@@ -144,6 +145,11 @@ class ClipLinkBridge:
         self._openchamber_latency_ms = latency_ms
         self.write_status_file()
 
+    def set_model_first_response(self, latency_ms: int | None) -> None:
+        """记录真实模型首响应测量值（或 None 清除），并立即写状态文件。"""
+        self._model_first_response_ms = latency_ms
+        self.write_status_file()
+
     def set_session_id(self, session_id: str | None) -> None:
         self._session_id = session_id
         self.write_status_file()
@@ -154,7 +160,7 @@ class ClipLinkBridge:
             "relay_status": self._relay_status,
             "model_status": self._model_status,
             "openchamber_latency_ms": self._openchamber_latency_ms,
-            "model_first_response_ms": None,
+            "model_first_response_ms": self._model_first_response_ms,
             "session_id": self._session_id,
             "updated_at": now_millis(),
         }

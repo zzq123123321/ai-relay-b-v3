@@ -96,6 +96,18 @@ def wire_ui(
         # 真正的 READY/RUNNING/结果文案由 monitor 事件回来后更新。
         if monitor is None:
             return
+        # 交付1: 严格识别 A→B 的 AI_RELAY_COMPLETE（包装之前，绝不发给 OpenChamber）。
+        # 只停 inbound 监听；不 stop monitor 线程 / 不清 Controller 任务 / 不关 ClipLink。
+        if task.text == "AI_RELAY_COMPLETE":
+            window.set_current_task("项目已完成，自动联动已停止")
+            window.append_log("收到 AI_RELAY_COMPLETE，自动联动已停止")
+            window.set_listening(False)
+            return
+        # 交付3: 普通新任务 → 清旧首响应（保留模型状态与 OC 服务延迟）
+        state = window._model_state
+        state["first_response_ms"] = None
+        bridge.set_model_first_response(None)
+        window.set_model_connection(state["status"], state["oc_ms"])
         monitor.submit_remote_task(task.event_id, task.text, window.wrapper_template())
         window.set_current_task("已收到A端任务，正在处理")
         window.append_log("收到 A端任务，正在后台处理")
@@ -196,6 +208,8 @@ def _dispatch_monitor_event(
             oc_ms=model_state.get("oc_ms"),
             first_response_ms=ev.get("first_response_ms"),
         )
+        # 交付3: UI 与 AIRelayLite/status.json 用同一真实测量值（不额外 ping）
+        bridge.set_model_first_response(ev.get("first_response_ms"))
     elif t == "result_complete":
         # 顺序关键：先交 Bridge（回传/接管 pending），再让 monitor 释放 Controller 任务
         window.set_recent_result(ev.get("text"))

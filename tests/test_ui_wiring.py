@@ -55,6 +55,7 @@ class FakeController:
         self.model_calls = 0
         self.sent_texts = []
         self.compact_calls = 0
+        self.finish_calls: list[str] = []
         self.auto_intakes: list[tuple[str, str, str]] = []
 
     def get_current_session(self):
@@ -82,6 +83,10 @@ class FakeController:
             return AutoTaskIntake(True, True)
         return AutoTaskIntake(True, False)
 
+    def finish_auto_task(self, event_id) -> bool:
+        self.finish_calls.append(event_id)
+        return True
+
 
 class FakeBridge:
     """ClipLinkBridge 的替身：记录调用，不读写真实文件。"""
@@ -90,6 +95,7 @@ class FakeBridge:
         self.listening_calls: list[bool] = []
         self.session_ids: list[str | None] = []
         self.model_statuses: list[tuple] = []
+        self.first_response_calls: list = []
         self.delivered: list[str] = []
         self.on_remote_task = None
 
@@ -101,6 +107,9 @@ class FakeBridge:
 
     def set_model_status(self, status: str, latency_ms: int | None = None) -> None:
         self.model_statuses.append((status, latency_ms))
+
+    def set_model_first_response(self, latency_ms) -> None:
+        self.first_response_calls.append(latency_ms)
 
     def deliver_result(self, text: str) -> None:
         self.delivered.append(text)
@@ -115,6 +124,7 @@ class FakeMonitor:
     def __init__(self) -> None:
         self.submit_calls: list[tuple[str, str, str]] = []
         self.ack_calls: list[str] = []
+        self.stop_calls = 0
         self._events: list[dict] = []
 
     def submit_remote_task(self, event_id: str, text: str, wrapper_template: str) -> None:
@@ -122,6 +132,9 @@ class FakeMonitor:
 
     def acknowledge_result(self, event_id: str) -> None:
         self.ack_calls.append(event_id)
+
+    def stop(self) -> None:
+        self.stop_calls += 1
 
     def drain_events(self) -> list[dict]:
         out = self._events
@@ -417,6 +430,105 @@ def test_monitor_poll_timer_does_no_http(qapp):
     assert _box(w, "task_box") == "大模型连接中断，等待恢复"
     assert bridge.model_statuses == [("disconnected", None)]
     timer.stop()
+
+
+# --- L05-05: AI_RELAY_COMPLETE 严格联动停止 + 首响应状态回写 -----------
+
+
+def test_complete_exact_stops_inbound_listening(qapp):
+    # 4+6+16+17: 严格命中 → 停 inbound 监听；不 stop monitor 线程/不清 Controller 任务/不发 OpenChamber
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.set_listening(True)  # 先开，验证命中后自动关闭
+    bridge.on_remote_task(RemoteTask("evt_c", "AI_RELAY_COMPLETE", "h", 1))
+    assert mon.submit_calls == []          # 4: 不 submit
+    assert mon.stop_calls == 0             # 16: 不停 monitor 线程
+    assert fake.finish_calls == []         # 17: 不清 Controller 任务
+    assert fake.model_calls == 0           # 不发 OpenChamber
+    assert w._listening is False           # 6: inbound 监听关闭
+    assert bridge.listening_calls == [True, False]  # 手动开 + COMPLETE 自动停
+
+
+def test_complete_wrapper_not_read(qapp):
+    # 5: 严格命中 → 不读取/不消费 wrapper 模板；普通任务则会带上包装模板
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w._wrapper_template = "前{content}后"
+    bridge.on_remote_task(RemoteTask("evt_c", "AI_RELAY_COMPLETE", "h", 1))
+    assert mon.submit_calls == []
+    bridge.on_remote_task(RemoteTask("evt_n", "normal", "h", 2))
+    assert mon.submit_calls == [("evt_n", "normal", "前{content}后")]
+
+
+def test_complete_updates_ui(qapp):
+    # 7: 严格命中 → UI 当前任务/日志正确 + 监听按钮变 [开始监听]
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    bridge.on_remote_task(RemoteTask("evt_c", "AI_RELAY_COMPLETE", "h", 1))
+    assert _box(w, "task_box") == "项目已完成，自动联动已停止"
+    assert "收到 AI_RELAY_COMPLETE，自动联动已停止" in _log(w)
+    assert w._btn_listen.text() == "开始监听"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        " AI_RELAY_COMPLETE",       # 前空格
+        "AI_RELAY_COMPLETE ",       # 后空格
+        "AI_RELAY_COMPLETE\n",      # 换行
+        "AI_RELAY_COMPLETE\r\n",    # CRLF
+        "ai_relay_complete",        # 大小写不同
+        "AI_RELAY_COMPLETE。",      # 尾部标点
+        "完成：AI_RELAY_COMPLETE",  # 含前缀
+    ],
+)
+def test_complete_non_exact_not_matched(qapp, text):
+    # 8+9+10: 任何非严格相等 → 不命中，作为普通 RemoteTask submit，监听状态不变
+    fake = FakeController()
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    bridge.on_remote_task(RemoteTask("evt_x", text, "h", 1))
+    assert mon.submit_calls == [("evt_x", text, "{content}")]
+    assert w._listening is False  # 非命中不触发 COMPLETE 停止逻辑
+
+
+def test_first_response_writes_bridge_status(qapp):
+    # 12+13: first_response 事件 → UI 显示真实 ms 且 bridge.set_model_first_response(ms)
+    fake = FakeController(model_result=ModelConnectionResult(True, 9, True, None))
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    mon.push({"type": "first_response", "first_response_ms": 333})
+    process_monitor_events(mon, w, bridge)
+    assert "333 ms" in _label(w, "llm_first")
+    assert bridge.first_response_calls == [333]
+
+
+def test_new_task_resets_first_response_keeps_oc(qapp):
+    # 11: 普通新任务开始 → 首响应清为 None（UI 显示 -- ms），保留 OC 服务延迟
+    fake = FakeController(model_result=ModelConnectionResult(True, 18, True, None))
+    bridge = FakeBridge()
+    mon = FakeMonitor()
+    w = _wired(qapp, fake, bridge, mon)
+    w.test_model_requested.emit()  # OC 服务延迟 18ms
+    mon.push({"type": "first_response", "first_response_ms": 820})
+    process_monitor_events(mon, w, bridge)
+    assert "820 ms" in _label(w, "llm_first")
+    assert bridge.first_response_calls[-1] == 820
+    # 新任务：清首响应，保留 OC 服务延迟
+    bridge.on_remote_task(RemoteTask("evt_n", "new task", "h", 2))
+    assert "18 ms" in _label(w, "llm_oc")
+    assert "-- ms" in _label(w, "llm_first")
+    assert w._model_state["first_response_ms"] is None
+    assert bridge.first_response_calls[-1] is None
+    assert mon.submit_calls == [("evt_n", "new task", "{content}")]
 
 
 def test_refresh_session_calls_bridge_set_session_id(qapp):
