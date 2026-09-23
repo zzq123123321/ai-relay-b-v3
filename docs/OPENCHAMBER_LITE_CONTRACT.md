@@ -36,6 +36,22 @@
 - 候选 2：读 Electron/Web UI 的 localStorage 落盘文件（`oc.lastSession.v1`）→ 得到"最后一次激活"的 session+directory；对桌面版可行，实时性受限于切会话时机。
 - 候选 3：给 OpenChamber 提一个"上报 UI 激活会话"的上游改动（写 `%LOCALAPPDATA%` 状态文件）→ 最干净，但依赖上游/自建 fork。
 
+## B2. L02-01 实现落定（候选 2，2026-09-23 实测）
+
+A 端裁决走**候选 2**：读 OpenChamber 自己落盘的 `oc.lastSession.v1`。已实现 `active_session_reader.py`（只读）+ `openchamber_client.validate_session()`（`GET /api/session/{id}/message?directory=...` 只读核实会话存在/directory 可用）。
+
+真机事实（Windows，Electron/Desktop，`OpenChamber.exe`，OpenChamber v1.24.2）：
+
+1. **存储位置**：`%APPDATA%\OpenChamber\Local Storage\leveldb`（Chromium LevelDB，origin `openchamber-ui://app`）。另有内嵌浏览器分区 `%APPDATA%\OpenChamber\Partitions\openchamber-browser\Local Storage\leveldb`（本例无 UI 键）。
+2. **值结构**（源码 `last-session-cache.ts`）：`{"version":1,"runtimes":{"<runtimeKey>":{"sessionId","directory","updatedAt"}}}`；每次 `setCurrentSession()` 都会写。桌面 loopback 的 `runtimeKey` 恒为 `"local"`（`runtime-switch.ts`）。
+3. **可靠性边界**：
+   - 值走 Chromium localStorage→磁盘，链路为 `persistLastActiveSession` → deferred storage（`setTimeout(flush,0)` 近即时）→ `window.localStorage` → 浏览器进程 LevelDB WAL。读到的是**最后一次已落盘快照**，相对 UI 实时状态有落盘延迟 → 属 `persisted-last-active`，非 `exact/live`。调用方必须再 `validate_session` 核实。
+   - 本机 LevelDB 数据块 **comp=none**（metaindex 无 `compression.type`），值紧跟 key 之后为明文字节，reader 用"key 后取 JSON"只读扫描（`*.log` 优先 `*.ldb`，新→旧，删除遮蔽）。若未来 Chromium 改压缩 SST，需补解压。
+   - **本次采样该 key 在 WAL/SST 均无活动值**（等 60s 未出现，仅 MANIFEST 有历史引用）→ `read_active_session()` 返回 `None`（`unavailable`）。这是正确结果，非读取失败；值一旦被 UI 写入并落盘即可读到。
+4. **view/unview/attention 不改变方案**：切会话时 UI 只调内存 `markSessionViewed`（`notification-store.ts`，无 HTTP）；`POST /api/sessions/:id/view|unview`、`GET /api/sessions/attention` 在 Web/Desktop UI 切会话路径**均不触发** → 不改用 `isViewed`（源码实证，非猜测）。
+
+**L02-01 只读实测**：`GET /health` 200（40 ms）；`GET /api/session/{dummy}/message` 404→`validate_session=False`（端点可达）；真实 POST/compact/create = 0。
+
 ## E. compact 源码证据
 
 - UI 的"压缩会话" = composer 斜杠命令 `/compact`（`packages/ui/src/components/chat/CommandAutocomplete.tsx:156`）→ `opencodeClient.summarizeSession(...)`（`packages/ui/src/lib/opencode/client.ts:1123-1132`）→ SDK `session.summarize` → **`POST /session/{sessionID}/summarize`**（SDK `@opencode-ai/sdk@1.18.29` 映射，query `directory`/`workspace` 可选，body `{providerID, modelID, auto?}`）。

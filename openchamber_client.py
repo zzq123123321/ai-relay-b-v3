@@ -119,6 +119,33 @@ class OpenChamberClient:
             return ProbeResult(False, latency, "malformed: health is not an object")
         return ProbeResult(True, latency, None)
 
+    def validate_session(self, session_id: str, directory: str | None = None) -> bool:
+        """只读核实：会话是否存在、directory 是否可用。
+
+        用现有合同 `GET /api/session/{id}/message?directory=...`：
+        2xx 表示该 session 存在且可取消息（directory 可用）；404/4xx/
+        连接失败一律 False。永不抛异常。directory 为 None 时不带该参数。
+        """
+        if not session_id:
+            return False
+        url = (
+            f"{self.base_url}/api/session/"
+            f"{urllib.parse.quote(str(session_id), safe='')}/message"
+        )
+        if directory:
+            url += f"?directory={urllib.parse.quote(str(directory), safe='/')}"
+        request = urllib.request.Request(url)
+        if self._token:
+            request.add_header("Authorization", f"Bearer {self._token}")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response.read(1)
+                return response.status < 400
+        except urllib.error.HTTPError as exc:
+            return exc.code < 400
+        except (TimeoutError, socket.timeout, urllib.error.URLError, OSError):
+            return False
+
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int((time.perf_counter() - started) * 1000))
