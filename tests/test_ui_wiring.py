@@ -15,15 +15,18 @@
 12 auto_compact_changed → 不调用 compact_session
 """
 
+import json
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
+from cliplink_status import now_millis
 from controller import CurrentSession, LiteController, ModelConnectionResult
-from main import wire_ui
+from main import apply_cliplink_status, start_cliplink_poll, wire_ui
 from openchamber_client import CompactResult, SendResult
 from ui.main_window import MainWindow
 
@@ -183,3 +186,75 @@ def test_auto_compact_does_not_call_compact(qapp):
     w.auto_compact_changed.emit(False)
     assert fake.compact_calls == 0  # 只是切换 UI 状态，不真正压缩
     assert "自动压缩已设置为开，后台策略将在后续阶段接入" in _log(w)
+
+
+# --- A端连接卡 ← ClipLink status.json 接线（全 tmp 文件，offscreen）-----
+
+
+def _write_cliplink_status(path: Path, **fields) -> Path:
+    base = {
+        "version": 1,
+        "status": "connected",
+        "peer_name": None,
+        "peer_ip": None,
+        "latency_ms": None,
+        "generation": 0,
+        "updated_at": 1000,
+    }
+    base.update(fields)
+    path.write_text(json.dumps(base), encoding="utf-8")
+    return path
+
+
+def test_cliplink_connected_shows_peer_and_latency(qapp, tmp_path):
+    w = MainWindow()
+    w.show()
+    p = _write_cliplink_status(
+        tmp_path / "status.json",
+        status="connected",
+        peer_name="A端PC",
+        peer_ip="192.168.1.5",
+        latency_ms=42,
+        updated_at=1000,
+    )
+    apply_cliplink_status(w, path=p, now_ms=2000)  # 距今 1s，未过旧
+    assert "已连接" in _label(w, "a_status")
+    assert _label(w, "a_peer") == "对端：A端PC (192.168.1.5)"
+    assert "42 ms" in _label(w, "a_latency")
+
+
+def test_cliplink_stale_connection_shows_disconnected(qapp, tmp_path):
+    w = MainWindow()
+    w.show()
+    p = _write_cliplink_status(
+        tmp_path / "status.json", status="connected", peer_name="A端PC", latency_ms=42, updated_at=1000
+    )
+    apply_cliplink_status(w, path=p, now_ms=1000 + 31_000)  # 31s 无更新 → 假连接
+    assert "已断开(过旧)" in _label(w, "a_status")
+    assert "-- ms" in _label(w, "a_latency")
+
+
+def test_cliplink_missing_file_shows_offline(qapp, tmp_path):
+    w = MainWindow()
+    w.show()
+    apply_cliplink_status(w, path=tmp_path / "absent.json", now_ms=5_000)
+    assert "未连接" in _label(w, "a_status")
+    assert _label(w, "a_peer") == "对端：--"
+    assert "-- ms" in _label(w, "a_latency")
+
+
+def test_start_cliplink_poll_refreshes_first_frame(qapp, tmp_path):
+    w = MainWindow()
+    w.show()
+    p = _write_cliplink_status(
+        tmp_path / "status.json",
+        status="connected",
+        peer_name="A端PC",
+        latency_ms=15,
+        updated_at=now_millis(),  # 与真实时钟同步 → 首帧未过旧
+    )
+    timer = start_cliplink_poll(w, interval_ms=60_000, path=p)  # 长间隔，避免测试期间再触发
+    assert "已连接" in _label(w, "a_status")
+    assert "15 ms" in _label(w, "a_latency")
+    assert timer.isActive()
+    timer.stop()

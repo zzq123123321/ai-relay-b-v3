@@ -6,8 +6,10 @@
 
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from cliplink_status import snapshot
 from controller import LiteController
 from ui.main_window import MainWindow
 
@@ -69,12 +71,36 @@ def wire_ui(window: MainWindow, controller: LiteController) -> None:
     window.auto_compact_changed.connect(on_auto_compact)
 
 
+def apply_cliplink_status(window: MainWindow, path=None, now_ms: int | None = None) -> None:
+    """读一次 ClipLink 状态文件并刷新“A端连接”卡（文件缺失/损坏 → 未连接）。
+
+    纯“读+判定+刷新”，无计时器，便于测试直接以固定 now_ms 调用。
+    """
+    status, peer, latency = snapshot(path, now_ms)
+    window.set_a_connection(status, peer, latency)
+
+
+def start_cliplink_poll(window: MainWindow, interval_ms: int = 2000, path=None) -> QTimer:
+    """定时轮询 ClipLink 状态文件：GUI 线程 QTimer，非后台线程框架。
+
+    首帧立即刷新一次，之后每 interval_ms 读一次；计时器挂到 window 下随窗口存活，
+    返回计时器以便测试/关闭时 stop。
+    """
+    timer = QTimer(window)
+    timer.setInterval(interval_ms)
+    timer.timeout.connect(lambda: apply_cliplink_status(window, path))
+    timer.start()
+    apply_cliplink_status(window, path)
+    return timer
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("AI Relay B Lite")
     window = MainWindow()
     controller = LiteController()
     wire_ui(window, controller)
+    start_cliplink_poll(window)
     window.show()
     sys.exit(app.exec())
 

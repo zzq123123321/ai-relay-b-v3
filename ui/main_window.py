@@ -1,7 +1,7 @@
 """AI Relay B Lite 单页 UI 骨架。
 
-只做布局、控件与 UI 内部行为；本轮不接真实网络、不发模型、不压缩真实会话、
-不读 ClipLink，也不 import OpenChamberClient（Controller 接线留待下一轮）。
+只做布局、控件与 UI 内部行为；“A端连接”卡由 main 层轮询 ClipLink 状态文件后
+调用 set_a_connection 刷新（本模块不直接读文件、不发网络、不 import OpenChamberClient）。
 单窗口、无侧边栏 / Tab / 设置页。
 """
 
@@ -224,8 +224,8 @@ class MainWindow(QMainWindow):
         a_card, a_lay = self._card("A端连接")
         a_card.setObjectName("a_card")
         self._a_status = self._status_label(a_lay, "● 未连接", "a_status")
-        self._a_peer = self._plain_label(a_lay, "对端：--")
-        self._a_latency = self._plain_label(a_lay, "网络延迟：-- ms")
+        self._a_peer = self._plain_label(a_lay, "对端：--", "a_peer")
+        self._a_latency = self._plain_label(a_lay, "网络延迟：-- ms", "a_latency")
         a_lay.addStretch(1)
 
         m_card, m_lay = self._card("大模型连接")

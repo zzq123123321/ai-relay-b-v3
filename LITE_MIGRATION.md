@@ -88,3 +88,11 @@ ai_relay_b_lite/
 ```
 
 L01 阶段验收：openchamber_client 对假/本机接口测通"服务检测 + 当前激活会话 + 发送 + 读结果 + compact"，不改 UI。
+
+## 七、实现进度（B 端接力交付记录）
+
+- **L04-02**（2026-09-23）：功能边界 #1/#10（A端连接，只读 status.json）已实现——
+  - 新增 `cliplink_status.py`：只读 `%LOCALAPPDATA%\ClipLink\status.json`（BOM/损坏/缺失一律收敛，不抛），并把 `updated_at` 用于假连接判定——`status==connected` 静默超过 3×ClipLink 心跳(30s) 判为"已断开(过旧)"；状态/对端/RTT 映射成 UI 文案。
+  - `main.py` 用 GUI 线程 `QTimer`（2s，非后台线程框架）轮询，经 `MainWindow.set_a_connection` 刷新"A端连接"卡；`paused` 不按假连接降级、也不等同 `connected`。
+  - 模块名 `cliplink_status.py`（本轮只读展示），区别于"建议结构"里的 `cliplink_bridge.py`（后续剪贴板自动中继的读+写桥，尚未建）。
+  - 测试：`tests/test_cliplink_status.py`（纯）+ `tests/test_ui_wiring.py` 增 4 例接线；全量 **109 passed**。
