@@ -51,6 +51,8 @@ class FakeClient:
         progress_fn=None,
         result=None,
         result_fn=None,
+        probe_fn=None,
+        send_fn=None,
     ) -> None:
         self.validate_result = validate
         self.send_result = send if send is not None else SendResult(True, None, "msg_1")
@@ -64,6 +66,8 @@ class FakeClient:
         self.progress_fn = progress_fn
         self.result = result
         self.result_fn = result_fn
+        self.probe_fn = probe_fn
+        self.send_fn = send_fn
         self.validated = []
         self.sent = []
         self.compacted = []
@@ -77,6 +81,8 @@ class FakeClient:
         return self.validate_result
 
     def probe(self):
+        if self.probe_fn is not None:
+            return self.probe_fn()
         return ProbeResult(self.probe_connected, self.latency_ms, None if self.probe_connected else "timeout")
 
     def resolve_execution_config(self, session_id, directory=None):
@@ -85,6 +91,8 @@ class FakeClient:
 
     def send_text(self, session_id, directory, text):
         self.sent.append((session_id, directory, text))
+        if self.send_fn is not None:
+            return self.send_fn(session_id, directory, text)
         return self.send_result
 
     def compact_session(self, session_id, directory):
@@ -349,6 +357,8 @@ ONLINE = dict(probe_connected=True, config=CFG)
 IDLE_ST = SessionStatusResult(True, "idle", None)
 BUSY_ST = SessionStatusResult(True, "busy", None)
 PROG_BASE = TaskProgressResult(True, "base_marker", True)
+PROBE_ON = ProbeResult(True, 1, None)
+PROBE_OFF = ProbeResult(False, 1, "timeout")
 
 
 def _make_running(client):
@@ -630,18 +640,18 @@ def test_idle_still_accepts_new_task():
 
 # ===================== L05-03 交付3：结果检查入口 =====================
 
-# 19. resume accepted 后 Controller 保存 resume_message_id
+# 19. resume accepted 后 Controller 保存 resume_message_ids（累计）
 def test_resume_accepted_saves_resume_message_id():
     client = FakeClient(**ONLINE, send=SendResult(True, None, "m_resume"), status=IDLE_ST, progress=PROG_BASE)
     ctrl = _make_running(client)
     task = ctrl._auto_task
-    assert task.resume_message_id is None  # 首次发送后尚未续接
+    assert task.resume_message_ids == set()  # 首次发送后尚未续接
     task.state = AUTO_RECOVER_CHECK
     task.recover_baseline = PROG_BASE.marker  # 无进展
     task.recover_started_ms = 0
     result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS)
     assert result.action == "resume_sent"
-    assert task.resume_message_id == "m_resume"
+    assert task.resume_message_ids == {"m_resume"}
     # resume 用冻结 session，发固定续接
     assert client.sent[-1] == ("ses_x", r"C:\work", RESUME_PROMPT)
 
@@ -654,10 +664,10 @@ def test_inspect_result_uses_frozen_session():
     other = ActiveSession(session_id="ses_other", directory=r"D:\other", source="x")
     ctrl._read_active_session = lambda: other  # UI 已切到别的会话
     task = ctrl._auto_task
-    task.resume_message_id = "m_resume"  # 模拟本恢复周期已发过一次续接
+    task.resume_message_ids = {"m_resume"}  # 模拟已发过自动续接
     view = ctrl.inspect_auto_task_result()
     assert view is complete  # 透传 client 识别结果
-    # 调用用的是冻结目标 + 允许的 resume_message_id，而非 UI 当前会话
+    # 调用用的是冻结目标 + 允许的 resume_message_ids，而非 UI 当前会话
     assert client.result_calls == [("ses_x", r"C:\work", "m1", {"m_resume"})]
 
 
@@ -696,3 +706,55 @@ def test_inspect_no_task_or_not_sent():
     view2 = ctrl2.inspect_auto_task_result()
     assert view2.complete is False
     assert client2.result_calls == []  # 还没真正发出 → 不调 client
+
+
+# ===================== L05-03-FIX1：多次中断的 resume 历史 =====================
+
+# 2. 第一次 resume 后再次进入 MODEL_OFFLINE → U1 仍保留；7. 新恢复周期只重置
+#    resume_attempted，不删除历史 IDs；3. 第二次 resume accepted → ids={U1,U2}
+def test_multi_resume_history_preserved():
+    sends = iter([SendResult(True, None, "U0"), SendResult(True, None, "U1"),
+                  SendResult(True, None, "U2")])
+    probe = {"on": True}
+    client = FakeClient(**ONLINE, status=IDLE_ST, progress=PROG_BASE,
+                        probe_fn=lambda: PROBE_ON if probe["on"] else PROBE_OFF,
+                        send_fn=lambda s, d, t: next(sends))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert task.message_id == "U0"
+    assert task.resume_message_ids == set()
+
+    # 第一次中断 → resume U1
+    probe["on"] = False
+    assert ctrl.watchdog_tick(now_ms=0).action == "offline"          # RUNNING→MODEL_OFFLINE
+    probe["on"] = True
+    assert ctrl.watchdog_tick(now_ms=0).action == "recover_check"    # →RECOVER_CHECK
+    assert task.resume_attempted is False
+    assert task.resume_message_ids == set()
+    assert ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS).action == "resume_sent"  # →RESUME_SENT
+    assert task.resume_message_ids == {"U1"}
+    assert task.resume_attempted is True
+
+    # 第二次中断：新恢复周期只重置 resume_attempted，绝不删除历史 U1
+    probe["on"] = False
+    assert ctrl.watchdog_tick(now_ms=0).action == "offline"          # RESUME_SENT→MODEL_OFFLINE
+    assert task.resume_attempted is False
+    assert task.resume_message_ids == {"U1"}
+    probe["on"] = True
+    assert ctrl.watchdog_tick(now_ms=0).action == "recover_check"    # →RECOVER_CHECK
+    assert task.resume_attempted is False
+    assert task.resume_message_ids == {"U1"}
+    # 第二次 resume → 追加 U2（历史保留）
+    assert ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS).action == "resume_sent"
+    assert task.resume_message_ids == {"U1", "U2"}
+
+
+# 4. inspect_auto_task_result() → allowed_followup_user_ids 同时包含全部 resume IDs
+def test_inspect_allows_all_resume_ids():
+    complete = TaskResultResult(True, True, "DONE", 120, False, False, None)
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), result=complete)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.resume_message_ids = {"U1", "U2", "U3"}  # 模拟经历多次中断续接
+    ctrl.inspect_auto_task_result()
+    assert client.result_calls == [("ses_x", r"C:\work", "m1", {"U1", "U2", "U3"})]

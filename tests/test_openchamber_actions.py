@@ -638,5 +638,39 @@ def test_result_first_response_not_overridden_by_resume(monkeypatch, tmp_path):
     assert r.first_response_ms == 100  # 来自原任务 a1（streamed 1100-1000），非 a2 的 1000
 
 
+# 19. 多次 resume 全部 allowed → 不 ambiguous，最终 assistant 可识别
+def test_result_multiple_resumes_all_allowed(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _asst("a1", streamed=1100, completed=None),          # 原响应中断
+        _user_msg(user_id="r1", created=1600),               # 系统 resume #1
+        _asst("a2", streamed=1800, completed=None),          # 续接响应又中断
+        _user_msg(user_id="r2", created=2000),               # 系统 resume #2
+        _asst("a3", streamed=2200, completed=2300,
+              parts=[{"type": "text", "text": "final"}]),    # 第二次续接后完成
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1", allowed_followup_user_ids=["r1", "r2"])
+    assert r.ambiguous is False
+    assert r.complete is True
+    assert r.text == "final"
+
+
+# 20. 多次 resume 中夹杂人为 user → 仍 ambiguous（不因修复放宽成"所有 user 都合法"）
+def test_result_manual_user_among_resumes_ambiguous(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _user_msg(user_id="manual", created=1500),  # 人为手动插入
+        _user_msg(user_id="r1", created=1600),
+        _user_msg(user_id="r2", created=2000),
+        _asst("a3", streamed=2200, completed=2300,
+              parts=[{"type": "text", "text": "final"}]),
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1", allowed_followup_user_ids=["r1", "r2"])
+    assert r.ambiguous is True   # manual 不在 allowed 集合
+    assert r.complete is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

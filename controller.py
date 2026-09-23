@@ -9,7 +9,7 @@ bus/repository/service 等任何额外层。依赖注入：client 与 active_ses
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from active_session_reader import read_active_session
 from openchamber_client import (
@@ -76,9 +76,10 @@ class AutoTask:
     wrapped_text: str
     state: str = AUTO_IDLE
     message_id: str | None = None
-    # 系统自动续接（resume_prompt）send accepted 后保存的 user message id：
-    # 最终结果解析据此识别"这条后续 user 是自动续接，不是用户手动插的新任务"。
-    resume_message_id: str | None = None
+    # 系统自动续接（resume_prompt）send accepted 后累计保存的全部 user message id：
+    # 任务可能经历多次中断→续接，历史必须跨恢复周期保留（整个 AutoTask 生命周期有效），
+    # 最终结果解析据此把"这些后续 user 都是自动续接，不是用户手动插的新任务"。
+    resume_message_ids: set[str] = field(default_factory=set)
     error: str | None = None
     # 首次 accepted 后冻结的原执行 session 目标
     session_id: str | None = None
@@ -186,13 +187,13 @@ class LiteController:
         本轮只识别，不负责交付/清理（绝不把 AutoTask 清回 IDLE）。
         没有自动任务，或任务还没真正发出（无冻结 message_id）→ complete=False。
         有冻结目标时，用冻结的 session_id/directory/message_id 调
-        client.get_task_result（不读 UI 当前激活会话）；allowed follow-up 在
-        resume_message_id 有值时加入，避免把系统自动续接误判为用户手动新任务。
+        client.get_task_result（不读 UI 当前激活会话）；allowed follow-up 加入
+        全部 resume_message_ids，避免把系统自动续接（可能有多次）误判为用户手动新任务。
         """
         task = self._auto_task
         if task is None or task.message_id is None:
             return TaskResultResult(True, False, None, None, False, False, None)
-        allowed = {task.resume_message_id} if task.resume_message_id else None
+        allowed = task.resume_message_ids if task.resume_message_ids else None
         return self._client.get_task_result(
             task.session_id, task.directory, task.message_id, allowed
         )
@@ -222,7 +223,6 @@ class LiteController:
             if not self._client.probe().connected:
                 task.state = AUTO_MODEL_OFFLINE
                 task.resume_attempted = False
-                task.resume_message_id = None
                 task.recover_baseline = None
                 task.recover_started_ms = None
                 action = "offline"
@@ -234,7 +234,6 @@ class LiteController:
                     task.recover_baseline = prog.marker
                     task.recover_started_ms = now_ms
                     task.resume_attempted = False
-                    task.resume_message_id = None
                     task.state = AUTO_RECOVER_CHECK
                     action = "recover_check"
                 # 原 session/messages 暂时读不到 → 不发 resume，保持 MODEL_OFFLINE 等下一 tick
@@ -246,7 +245,6 @@ class LiteController:
             if not self._client.probe().connected:
                 task.state = AUTO_MODEL_OFFLINE
                 task.resume_attempted = False
-                task.resume_message_id = None
                 task.recover_baseline = None
                 task.recover_started_ms = None
                 action = "offline"
@@ -297,7 +295,7 @@ class LiteController:
                 task.state = AUTO_RESUME_SENT
                 task.error = None
                 if result.message_id:
-                    task.resume_message_id = result.message_id
+                    task.resume_message_ids.add(result.message_id)
                 return "resume_sent"
             task.error = result.error
         return "none"
