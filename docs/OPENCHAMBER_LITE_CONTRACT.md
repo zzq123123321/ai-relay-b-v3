@@ -52,6 +52,25 @@ A 端裁决走**候选 2**：读 OpenChamber 自己落盘的 `oc.lastSession.v1`
 
 **L02-01 只读实测**：`GET /health` 200（40 ms）；`GET /api/session/{dummy}/message` 404→`validate_session=False`（端点可达）；真实 POST/compact/create = 0。
 
+## C2. L02-02 执行配置复用 + wire shape 实证（2026-09-23 只读）
+
+**裁决**：UI 不再显示/配置 Agent、Model、工作目录；`session_id+directory` 来自当前会话解析，`agent+providerID+modelID+variant` 直接从当前会话历史**复用**，不猜默认模型。
+
+**执行配置来源**（`openchamber_client.resolve_execution_config`）：
+1. **首选**：当前 session 历史中**最近一条配置完整的 assistant 消息**（`agent`+`providerID`+`modelID` 均非空；`variant` 可空；按 `time.created` 取最新，不完整则向前跳过）。
+2. **回退**：会话对象自身的 `agent` + `model{id, providerID, variant}`。
+3. 都无 → `unavailable`（上层显示"无法取得当前会话的模型配置"）。
+
+**真机 wire shape 实证**（v1.24.2，只读 GET）：
+- 消息 `info` 键集：`agent, cost, finish, id, mode, modelID, parentID, path, providerID, role, sessionID, time, tokens, variant` → **消息用平铺 `providerID`/`modelID` + 可选 `variant`**（无合并 `model` 字段）。
+- 会话对象键集：`agent, cost, directory, id, model, path, projectID, slug, summary, time, title, tokens, version`，其中 `model = {id, providerID, variant}` → **会话用 `model.id`（非 `modelID`）**。
+- 真机解析实测（跨两种 provider 均正确）：`4090/qwen3.8-27b/variant=平均`；`opencode/big-pickle/variant=None`。
+
+**prompt_async body**（`send_text`，text 原样、不包装）：`{messageID, model:{providerID, modelID}, agent, variant, parts:[{type:"text", text}]}`；HTTP 204=accepted（≠完成）。
+**summarize body**（`compact_session`）：`{providerID, modelID}`；成功 = HTTP 200 且 body `true`。
+
+**L02-02 只读实测**：真实 GET 12 次（health + session 列表 + 会话消息 + 单会话对象，全部只读）；`real_prompt_post=0 / real_compact=0 / real_create=0`。
+
 ## E. compact 源码证据
 
 - UI 的"压缩会话" = composer 斜杠命令 `/compact`（`packages/ui/src/components/chat/CommandAutocomplete.tsx:156`）→ `opencodeClient.summarizeSession(...)`（`packages/ui/src/lib/opencode/client.ts:1123-1132`）→ SDK `session.summarize` → **`POST /session/{sessionID}/summarize`**（SDK `@opencode-ai/sdk@1.18.29` 映射，query `directory`/`workspace` 可选，body `{providerID, modelID, auto?}`）。
