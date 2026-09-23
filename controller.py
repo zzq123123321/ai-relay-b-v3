@@ -8,6 +8,7 @@ bus/repository/service 等任何额外层。依赖注入：client 与 active_ses
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from active_session_reader import read_active_session
@@ -15,10 +16,18 @@ from openchamber_client import CompactResult, OpenChamberClient, SendResult
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:57123"
 
-# 自动任务最小状态机：只有三态，无历史、无 OperationId、无队列。
+# 自动任务最小状态机，无历史、无 OperationId、无队列。
 AUTO_IDLE = "idle"
 AUTO_READY = "ready_to_send"
 AUTO_RUNNING = "running"
+AUTO_MODEL_OFFLINE = "model_offline"
+AUTO_RECOVER_CHECK = "recover_check"
+AUTO_RESUME_SENT = "resume_sent"
+
+# 中断恢复观察窗口：连续成功读到"无进展"满此值才允许发一次续接。
+RECOVER_OBSERVE_MS = 5000
+# 固定续接文本，与 wrapper / A端新消息 / A端连接状态完全无关。
+RESUME_PROMPT = "继续执行刚才未完成的任务，从中断处继续，不要重新开始。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,10 +59,12 @@ class ModelConnectionResult:
 
 @dataclass
 class AutoTask:
-    """单任务自动链最小状态：只有 IDLE/READY_TO_SEND/RUNNING，可就地改 state。
+    """单任务自动链最小状态：IDLE/READY/RUNNING/MODEL_OFFLINE/RECOVER_CHECK/RESUME_SENT。
 
     包装在任务到达时一次性完成并固化到 wrapped_text；模型恢复/重试只重发
     这个已保存的 wrapped_text，绝不重新读取包装模板、重新包装 raw text。
+    首次发送 accepted 后冻结 session_id/directory/message_id：watchdog、
+    progress check、resume_prompt 全部回到原 session，不随 UI 当前会话切换。
     """
 
     event_id: str
@@ -61,6 +72,13 @@ class AutoTask:
     state: str = AUTO_IDLE
     message_id: str | None = None
     error: str | None = None
+    # 首次 accepted 后冻结的原执行 session 目标
+    session_id: str | None = None
+    directory: str | None = None
+    # watchdog 中断恢复周期
+    recover_baseline: str | None = None
+    recover_started_ms: int | None = None
+    resume_attempted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +87,19 @@ class AutoTaskIntake:
 
     accepted: bool
     submitted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WatchdogTick:
+    """watchdog_tick() 的稳定小结果（供后续 UI 接线）：不含事件总线。
+
+    action ∈ none/sent/offline/recover_check/resumed_automatically/resume_sent。
+    """
+
+    previous_state: str
+    state: str
+    action: str
+    error: str | None = None
 
 
 class LiteController:
@@ -133,9 +164,112 @@ class LiteController:
         if result.accepted:
             task.state = AUTO_RUNNING
             task.message_id = result.message_id
+            # 冻结原执行 session：一旦 accepted，恢复目标不再随 UI 当前会话变化
+            task.session_id = session.session_id
+            task.directory = session.directory
             task.error = None
         else:
             task.error = result.error
+
+    # ------------------------------------------------------------- 模型 watchdog
+    def watchdog_tick(self, now_ms: int | None = None) -> WatchdogTick:
+        """纯控制入口：推进自动任务中断恢复状态机，本轮由测试/后续 worker 调用。
+
+        不碰 A端 ClipLink 状态。返回上一状态/新状态/动作/错误的小结果。
+        """
+        task = self._auto_task
+        if task is None:
+            return WatchdogTick(AUTO_IDLE, AUTO_IDLE, "none")
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        prev = task.state
+        action = "none"
+
+        if task.state == AUTO_READY:
+            self.try_send_pending_auto_task()
+            if task.state == AUTO_RUNNING:
+                action = "sent"
+
+        elif task.state == AUTO_RUNNING:
+            # 只 probe；OpenChamber 正常（哪怕 session status=idle）保持 RUNNING。
+            # idle 很可能是正常完成，最终结果识别交给 L05-03，绝不因此发 resume。
+            if not self._client.probe().connected:
+                task.state = AUTO_MODEL_OFFLINE
+                task.resume_attempted = False
+                task.recover_baseline = None
+                task.recover_started_ms = None
+                action = "offline"
+
+        elif task.state == AUTO_MODEL_OFFLINE:
+            if self._client.probe().connected:
+                prog = self._client.get_task_progress(task.session_id, task.directory, task.message_id)
+                if prog.read_ok:
+                    task.recover_baseline = prog.marker
+                    task.recover_started_ms = now_ms
+                    task.resume_attempted = False
+                    task.state = AUTO_RECOVER_CHECK
+                    action = "recover_check"
+                # 原 session/messages 暂时读不到 → 不发 resume，保持 MODEL_OFFLINE 等下一 tick
+
+        elif task.state == AUTO_RECOVER_CHECK:
+            action = self._recover_check_tick(task, now_ms)
+
+        elif task.state == AUTO_RESUME_SENT:
+            if not self._client.probe().connected:
+                task.state = AUTO_MODEL_OFFLINE
+                task.resume_attempted = False
+                task.recover_baseline = None
+                task.recover_started_ms = None
+                action = "offline"
+            else:
+                progressed = self._observed_progress(task)
+                if progressed:
+                    task.state = AUTO_RUNNING
+                    action = "resumed_automatically"
+                # 仍 idle 且无变化 → 保持 RESUME_SENT，不重复发续接
+
+        return WatchdogTick(prev, task.state, action, task.error)
+
+    def _observed_progress(self, task) -> bool:
+        """status busy/retry 或 progress marker 相对基线已变化 → 视为已自行恢复。
+
+        任一读取失败都不算"无进展"（避免误判）；仅在成功读到且确无变化时返回 False。
+        """
+        st = self._client.get_session_status(task.session_id)
+        if st.ok and st.status in ("busy", "retry"):
+            return True
+        prog = self._client.get_task_progress(task.session_id, task.directory, task.message_id)
+        if prog.read_ok and task.recover_baseline is not None and prog.marker != task.recover_baseline:
+            return True
+        return False
+
+    def _recover_check_tick(self, task, now_ms: int) -> str:
+        """RECOVER_CHECK：观察是否自行恢复；连续确认无进展满窗口才发一次固定续接。"""
+        st = self._client.get_session_status(task.session_id)
+        prog = self._client.get_task_progress(task.session_id, task.directory, task.message_id)
+        # 自动恢复：status busy/retry，或 marker 相对基线已变化
+        auto = (st.ok and st.status in ("busy", "retry")) or (
+            prog.read_ok and task.recover_baseline is not None and prog.marker != task.recover_baseline
+        )
+        if auto:
+            task.state = AUTO_RUNNING
+            return "resumed_automatically"
+        if not (st.ok and prog.read_ok):
+            # 读取失败 ≠ 无进展：不判定、不发 resume，继续观察
+            return "none"
+        if task.resume_attempted:
+            # 本恢复周期最多发一次续接，绝不逐 tick 重复
+            return "none"
+        started = task.recover_started_ms if task.recover_started_ms is not None else now_ms
+        if now_ms - started >= RECOVER_OBSERVE_MS:
+            result = self._client.send_text(task.session_id, task.directory, RESUME_PROMPT)
+            task.resume_attempted = True
+            if result.accepted:
+                task.state = AUTO_RESUME_SENT
+                task.error = None
+                return "resume_sent"
+            task.error = result.error
+        return "none"
 
     def _current_session(self) -> CurrentSession:
         session = self._read_active_session()

@@ -14,8 +14,24 @@
 """
 
 from active_session_reader import ActiveSession
-from controller import LiteController
-from openchamber_client import CompactResult, ExecutionConfig, ProbeResult, SendResult
+from controller import (
+    AUTO_IDLE,
+    AUTO_MODEL_OFFLINE,
+    AUTO_RECOVER_CHECK,
+    AUTO_RESUME_SENT,
+    AUTO_RUNNING,
+    RECOVER_OBSERVE_MS,
+    RESUME_PROMPT,
+    LiteController,
+)
+from openchamber_client import (
+    CompactResult,
+    ExecutionConfig,
+    ProbeResult,
+    SendResult,
+    SessionStatusResult,
+    TaskProgressResult,
+)
 
 
 class FakeClient:
@@ -27,6 +43,10 @@ class FakeClient:
         probe_connected=True,
         latency_ms=1,
         config=None,
+        status=None,
+        progress=None,
+        status_fn=None,
+        progress_fn=None,
     ) -> None:
         self.validate_result = validate
         self.send_result = send if send is not None else SendResult(True, None, "msg_1")
@@ -34,10 +54,16 @@ class FakeClient:
         self.probe_connected = probe_connected
         self.latency_ms = latency_ms
         self.config = config  # ExecutionConfig 或 None
+        self.status_result = status if status is not None else SessionStatusResult(True, "busy", None)
+        self.progress_result = progress if progress is not None else TaskProgressResult(True, "marker0", True)
+        self.status_fn = status_fn
+        self.progress_fn = progress_fn
         self.validated = []
         self.sent = []
         self.compacted = []
         self.resolved = []
+        self.status_calls = []
+        self.progress_calls = []
 
     def validate_session(self, session_id, directory=None):
         self.validated.append((session_id, directory))
@@ -57,6 +83,18 @@ class FakeClient:
     def compact_session(self, session_id, directory):
         self.compacted.append((session_id, directory))
         return self.compact_result
+
+    def get_session_status(self, session_id):
+        self.status_calls.append(session_id)
+        if self.status_fn is not None:
+            return self.status_fn(session_id)
+        return self.status_result
+
+    def get_task_progress(self, session_id, directory, user_message_id):
+        self.progress_calls.append((session_id, directory, user_message_id))
+        if self.progress_fn is not None:
+            return self.progress_fn(session_id, directory, user_message_id)
+        return self.progress_result
 
 
 SESSION = ActiveSession(
@@ -288,3 +326,225 @@ def test_new_task_while_running_is_busy():
     assert intake2.accepted is False
     assert ctrl._auto_task.event_id == "e1"
     assert ctrl._auto_task.wrapped_text == "RAW1"
+
+
+# ============================ L05-02 模型 watchdog ==========================
+
+ONLINE = dict(probe_connected=True, config=CFG)
+IDLE_ST = SessionStatusResult(True, "idle", None)
+BUSY_ST = SessionStatusResult(True, "busy", None)
+PROG_BASE = TaskProgressResult(True, "base_marker", True)
+
+
+def _make_running(client):
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")  # probe ok + config + accepted → RUNNING
+    assert ctrl._auto_task.state == AUTO_RUNNING
+    return ctrl
+
+
+def test_watchdog_no_task_is_idle():
+    client = FakeClient()
+    ctrl = _ctrl(client, SESSION)
+    result = ctrl.watchdog_tick()
+    assert result.previous_state == AUTO_IDLE
+    assert result.state == AUTO_IDLE
+    assert result.action == "none"
+
+
+# 6. 首次 accepted 后冻结 session_id/directory/message_id
+def test_frozen_session_target_after_accepted():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert task.session_id == "ses_x"
+    assert task.directory == r"C:\work"
+    assert task.message_id == "m1"
+
+
+# 7. READY_TO_SEND 模型恢复 → 用已保存 wrapped_text → RUNNING
+def test_watchdog_ready_recovers_saved_wrapped():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "W{content}")  # 离线 → READY, wrapped="WRAW"
+    assert ctrl._auto_task.state == "ready_to_send"
+    client.probe_connected = True  # 模型恢复
+    result = ctrl.watchdog_tick()
+    assert result.state == AUTO_RUNNING
+    assert result.action == "sent"
+    assert client.sent == [("ses_x", r"C:\work", "WRAW")]
+
+
+# 8. RUNNING probe 失败 → MODEL_OFFLINE
+def test_watchdog_running_offline():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    client.probe_connected = False
+    result = ctrl.watchdog_tick()
+    assert result.previous_state == AUTO_RUNNING
+    assert result.state == AUTO_MODEL_OFFLINE
+    assert result.action == "offline"
+
+
+# 9. MODEL_OFFLINE 仍失败 → 不发任何内容
+def test_watchdog_model_offline_still_offline():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _make_running(client)
+    ctrl._auto_task.state = AUTO_MODEL_OFFLINE
+    client.probe_connected = False
+    result = ctrl.watchdog_tick()
+    assert result.state == AUTO_MODEL_OFFLINE
+    assert result.action == "none"
+    assert len(client.sent) == 1  # 仅首次 wrapped，无新发送
+
+
+# 10. MODEL_OFFLINE 恢复 → RECOVER_CHECK → 记录 baseline
+def test_watchdog_model_offline_to_recover_check():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    ctrl._auto_task.state = AUTO_MODEL_OFFLINE
+    client.probe_connected = True
+    result = ctrl.watchdog_tick(now_ms=1000)
+    assert result.state == AUTO_RECOVER_CHECK
+    assert result.action == "recover_check"
+    assert ctrl._auto_task.recover_baseline == "base_marker"
+    assert ctrl._auto_task.recover_started_ms == 1000
+    assert ctrl._auto_task.resume_attempted is False
+    assert len(client.sent) == 1  # 无 resume
+
+
+# 11. RECOVER_CHECK status=busy → RUNNING，resume 0
+def test_recover_check_busy_auto_running():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=BUSY_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "base_marker"
+    task.recover_started_ms = 0
+    result = ctrl.watchdog_tick(now_ms=99999)
+    assert result.state == AUTO_RUNNING
+    assert result.action == "resumed_automatically"
+    assert len(client.sent) == 1
+
+
+# 12. RECOVER_CHECK marker 变化 → RUNNING，resume 0
+def test_recover_check_marker_change_auto_running():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST,
+                        progress=TaskProgressResult(True, "NEW_marker", True))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "OLD_marker"  # 与当前 marker 不同
+    task.recover_started_ms = 0
+    result = ctrl.watchdog_tick(now_ms=99999)
+    assert result.state == AUTO_RUNNING
+    assert result.action == "resumed_automatically"
+    assert len(client.sent) == 1
+
+
+# 13. RECOVER_CHECK 未满 5 秒 → resume 0
+def test_recover_check_under_window_no_resume():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "base_marker"  # 无变化
+    task.recover_started_ms = 9000
+    result = ctrl.watchdog_tick(now_ms=9500)  # 仅 500ms
+    assert result.state == AUTO_RECOVER_CHECK
+    assert result.action == "none"
+    assert len(client.sent) == 1
+
+
+# 14. progress read 失败 → 即使超过 5 秒也不发 resume
+def test_recover_check_progress_read_failure_no_resume():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST,
+                        progress=TaskProgressResult(False, None, False, "connection: refused"))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "base_marker"
+    task.recover_started_ms = 0
+    result = ctrl.watchdog_tick(now_ms=99999)  # 远超 5s
+    assert result.state == AUTO_RECOVER_CHECK
+    assert result.action == "none"
+    assert len(client.sent) == 1
+
+
+# 15. 满 5 秒且确认无进度 → 固定 resume_prompt 发送一次 → RESUME_SENT
+def test_recover_check_full_window_sends_resume_once():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m_resume"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "base_marker"
+    task.recover_started_ms = 0
+    result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS)  # 恰好满
+    assert result.state == AUTO_RESUME_SENT
+    assert result.action == "resume_sent"
+    assert client.sent[-1] == ("ses_x", r"C:\work", RESUME_PROMPT)
+    assert task.resume_attempted is True
+
+
+# 16. resume 用 frozen session（active reader 已切换仍发旧 session）
+def test_resume_uses_frozen_session():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")  # RUNNING on ses_x
+    other = ActiveSession(session_id="ses_other", directory=r"D:\other", source="x")
+    ctrl._read_active_session = lambda: other  # UI 已切到别的会话
+    task = ctrl._auto_task
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = "base_marker"
+    task.recover_started_ms = 0
+    ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS)
+    assert client.sent[-1] == ("ses_x", r"C:\work", RESUME_PROMPT)  # 仍是原 session
+
+
+# 17. RESUME_SENT 下一 tick → 不重复 resume
+def test_resume_sent_next_tick_no_repeat():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RESUME_SENT
+    task.resume_attempted = True
+    task.recover_baseline = "base_marker"
+    n = len(client.sent)
+    result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS + 5000)
+    assert result.state == AUTO_RESUME_SENT
+    assert result.action == "none"
+    assert len(client.sent) == n
+
+
+# 18. RESUME_SENT 观察到进度 → RUNNING
+def test_resume_sent_observes_progress():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=BUSY_ST,
+                        progress=TaskProgressResult(True, "NEW", True))
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    task.state = AUTO_RESUME_SENT
+    task.recover_baseline = "OLD"
+    result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS + 5000)
+    assert result.state == AUTO_RUNNING
+    assert result.action == "resumed_automatically"
+
+
+# 19. RUNNING 正常看到 idle → 仍 RUNNING，不误发 resume
+def test_running_idle_stays_running():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    n = len(client.sent)
+    result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS + 99999)
+    assert result.state == AUTO_RUNNING
+    assert result.action == "none"
+    assert len(client.sent) == n
+
+
+# 20. 整个 watchdog 不读取/依赖 A端 ClipLink 状态
+def test_watchdog_independent_of_a_connection():
+    import controller as mod
+
+    # 模块不 import 任何 cliplink 符号；controller 实例不持有 cliplink 引用
+    assert not any(name.startswith("cliplink") for name in vars(mod))
+    ctrl = LiteController(client=FakeClient(), active_session_reader=lambda: SESSION)
+    assert not any(attr.startswith("cliplink") for attr in vars(ctrl))

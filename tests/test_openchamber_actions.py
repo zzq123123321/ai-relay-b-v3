@@ -27,6 +27,8 @@ from openchamber_client import (
     ExecutionConfig,
     OpenChamberClient,
     SendResult,
+    SessionStatusResult,
+    TaskProgressResult,
 )
 
 
@@ -298,6 +300,90 @@ def test_compact_malformed_body_failure(monkeypatch, tmp_path):
     result = client.compact_session("ses_x", None)
     assert result.success is False
     assert result.error.startswith("malformed:")
+
+
+# --- 交付4：只读 watchdog API --------------------------------------------
+
+
+# --- A. session status ---
+def test_session_status_values(monkeypatch, tmp_path):
+    for status in ("busy", "retry", "idle"):
+        client, _ = _client(
+            monkeypatch, tmp_path,
+            [("/status", lambda r, s=status: FakeResponse(200, _json_body({"status": s})))],
+        )
+        result = client.get_session_status("ses_x")
+        assert isinstance(result, SessionStatusResult)
+        assert result.ok is True
+        assert result.status == status
+        assert result.error is None
+
+
+def test_session_status_404_not_idle(monkeypatch, tmp_path):
+    def raise_404(request):
+        raise urllib.error.HTTPError(request.full_url, 404, "nf", {}, io.BytesIO(b""))
+
+    client, _ = _client(monkeypatch, tmp_path, [("/status", raise_404)])
+    result = client.get_session_status("ses_x")
+    assert result.ok is False
+    assert result.status is None
+    assert result.error == "http: 404"
+
+
+def test_session_status_transport_failure_not_idle(monkeypatch, tmp_path):
+    def raise_conn(request):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+    client, _ = _client(monkeypatch, tmp_path, [("/status", raise_conn)])
+    result = client.get_session_status("ses_x")
+    assert result.ok is False
+    assert result.status is None
+    assert result.error.startswith("connection:")
+
+
+def test_session_status_malformed(monkeypatch, tmp_path):
+    client, _ = _client(monkeypatch, tmp_path, [("/status", lambda r: FakeResponse(200, b"{not-json"))])
+    result = client.get_session_status("ses_x")
+    assert result.ok is False
+    assert result.status is None
+    assert result.error.startswith("malformed:")
+
+
+# --- B. task progress marker ---
+def _progress_messages(assistant_text="hello"):
+    return [
+        {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "q"}]},
+        {"info": {"id": "a1", "role": "assistant"}, "parts": [{"type": "text", "text": assistant_text}]},
+    ]
+
+
+def test_task_progress_marker_found(monkeypatch, tmp_path):
+    client, _ = _client(monkeypatch, tmp_path, [("/message", lambda r: FakeResponse(200, _json_body(_progress_messages())))])
+    result = client.get_task_progress("ses_x", None, "u1")
+    assert isinstance(result, TaskProgressResult)
+    assert result.read_ok is True
+    assert result.user_message_found is True
+    assert result.marker
+
+
+def test_task_progress_marker_changes_on_content(monkeypatch, tmp_path):
+    client, _ = _client(monkeypatch, tmp_path, [("/message", lambda r: FakeResponse(200, _json_body(_progress_messages("v1"))))])
+    m1 = client.get_task_progress("ses_x", None, "u1").marker
+    client, _ = _client(monkeypatch, tmp_path, [("/message", lambda r: FakeResponse(200, _json_body(_progress_messages("v2"))))])
+    m2 = client.get_task_progress("ses_x", None, "u1").marker
+    assert m1 != m2
+
+
+def test_task_progress_get_failure_read_ok_false(monkeypatch, tmp_path):
+    def raise_conn(request):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+    client, _ = _client(monkeypatch, tmp_path, [("/message", raise_conn)])
+    result = client.get_task_progress("ses_x", None, "u1")
+    assert result.read_ok is False
+    assert result.marker is None
+    assert result.user_message_found is False
+    assert result.error.startswith("connection:")
 
 
 if __name__ == "__main__":

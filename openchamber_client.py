@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -107,6 +108,28 @@ class CompactResult:
 
     success: bool
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionStatusResult:
+    """get_session_status() 只读返回：严格区分 成功拿到 status 与 404/transport/malformed。"""
+
+    ok: bool
+    status: str | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProgressResult:
+    """get_task_progress() 只读返回：marker 是 user_message 之后内容的稳定指纹。
+
+    read_ok=False 表示 messages GET 失败，绝不代表"没有进度"。
+    """
+
+    read_ok: bool
+    marker: str | None
+    user_message_found: bool
+    error: str | None = None
 
 
 class OpenChamberClient:
@@ -303,6 +326,63 @@ class OpenChamberClient:
             return CompactResult(False, f"body not true: {ok!r}")
         return CompactResult(False, f"http: {status}")
 
+    def get_session_status(self, session_id: str) -> SessionStatusResult:
+        """只读 GET /api/sessions/{id}/status。
+
+        成功 = 2xx 且 body 有字符串 status 字段（busy/retry/idle...）。
+        404 / transport / malformed 均返回 ok=False 且各自 error 不同，绝不伪装成 idle。
+        """
+        if not session_id:
+            return SessionStatusResult(False, None, "empty: session_id 为空")
+        surl = f"{self.base_url}/api/sessions/{urllib.parse.quote(str(session_id), safe='')}/status"
+        status, body, error = self._http(surl)
+        if error is not None and status is None:
+            return SessionStatusResult(False, None, error)
+        if status is not None and 200 <= status < 300:
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return SessionStatusResult(False, None, "malformed: body is not JSON")
+            if isinstance(data, dict) and isinstance(data.get("status"), str):
+                return SessionStatusResult(True, data["status"], None)
+            return SessionStatusResult(False, None, "malformed: missing 'status'")
+        return SessionStatusResult(False, None, f"http: {status}")
+
+    def get_task_progress(
+        self, session_id: str, directory: str | None, user_message_id: str
+    ) -> TaskProgressResult:
+        """只读：判断"该 user message 之后的 session 内容是否发生了进展"。
+
+        在消息列表里定位 info.id == user_message_id，取其到尾部的内容生成
+        稳定 marker（canonical JSON → SHA-256）。assistant streaming 内容变化 /
+        新 tool part / 新 assistant message / 新 continuation 都会改变 marker。
+        不依赖 assistant parentID。messages GET 失败 → read_ok=False（≠没有进度）。
+        """
+        status, body, error = self._http(self._messages_url(session_id, directory))
+        if error is not None and status is None:
+            return TaskProgressResult(False, None, False, error)
+        if status is None or not (200 <= status < 300):
+            return TaskProgressResult(False, None, False, f"http: {status}")
+        try:
+            messages = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return TaskProgressResult(False, None, False, "malformed: body is not JSON")
+        if not isinstance(messages, list):
+            return TaskProgressResult(False, None, False, "malformed: messages not a list")
+        anchor = None
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if isinstance(info, dict) and info.get("id") == user_message_id:
+                anchor = i
+                break
+        found = anchor is not None
+        tail = messages[anchor:] if anchor is not None else messages
+        canonical = json.dumps(_progress_projection(tail), ensure_ascii=False, sort_keys=True)
+        marker = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return TaskProgressResult(True, marker, found, None)
+
 
 def _nonempty_str(value) -> str | None:
     if isinstance(value, str) and value.strip():
@@ -372,6 +452,31 @@ def _config_from_session(body: bytes) -> ExecutionConfig | None:
     if agent and provider_id and model_id:
         return ExecutionConfig(agent=agent, provider_id=provider_id, model_id=model_id, variant=variant, source="session")
     return None
+
+
+def _progress_projection(tail) -> list:
+    """把消息尾部投到稳定字段（id/role/各 part 的 type+text），供 marker 计算。
+
+    只取会随真实进展变化的字段；忽略 time.updated 之类易变字段，避免误判"有进度"。
+    """
+    projection = []
+    for message in tail:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info") or {}
+        parts = message.get("parts") or []
+        projection.append(
+            {
+                "id": info.get("id"),
+                "role": info.get("role"),
+                "parts": [
+                    {"type": p.get("type"), "text": p.get("text")}
+                    for p in parts
+                    if isinstance(p, dict)
+                ],
+            }
+        )
+    return projection
 
 
 def _elapsed_ms(started: float) -> int:
