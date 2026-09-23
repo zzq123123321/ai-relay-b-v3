@@ -132,6 +132,25 @@ class TaskProgressResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TaskResultResult:
+    """get_task_result() 只读返回：绑定原 user_message 的最终结果识别。
+
+    read_ok=False 表示 status/messages GET 失败或 user_message 找不到，
+    绝不把网络读取失败伪装成"模型没有结果"（complete=False 且无 error）。
+    complete=True 要求 session idle + 原任务后有合格的成功 assistant。
+    ambiguous=True 表示原任务后出现未知 user message，其后 assistant 不归本任务。
+    """
+
+    read_ok: bool
+    complete: bool
+    text: str | None
+    first_response_ms: int | None
+    ambiguous: bool
+    interrupted: bool
+    error: str | None = None
+
+
 class OpenChamberClient:
     def __init__(
         self,
@@ -383,6 +402,138 @@ class OpenChamberClient:
         marker = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return TaskProgressResult(True, marker, found, None)
 
+    def get_task_result(
+        self,
+        session_id: str,
+        directory: str | None,
+        user_message_id: str,
+        allowed_followup_user_ids=None,
+    ) -> TaskResultResult:
+        """只读：绑定原 user_message_id，识别其之后的最终结果。
+
+        结果必须绑定原任务：在消息列表里先定位 info.id == user_message_id，
+        只分析它之后的消息；绝不直接取整个 session 最后一条 assistant。
+        原任务之后允许的 user message 只有 user_message_id 本身 + 系统自动续接
+        （allowed_followup_user_ids，如 resume_message_id）；出现其它 user
+        → ambiguous=True 且 complete=False，其后 assistant 不归本任务。
+
+        complete=True 需同时：status 读取成功且 idle，且原任务后有合格的成功
+        assistant（finish=="stop"、time.completed 为数字、无 error、非 summary、
+        至少一个可见 text part）。busy/retry 或"仅 idle 无合格答案"都不算完成。
+        interrupted=True：已 idle 且有 assistant，但尾部 assistant 未形成可安全
+        回传的答案（completed 缺失/有 error/finish 为 error|content-filter|length）。
+        读取失败（status/messages GET、malformed、user_message 找不到）→ read_ok=False。
+        """
+        allowed = {user_message_id}
+        if allowed_followup_user_ids:
+            allowed |= set(allowed_followup_user_ids)
+
+        status = self.get_session_status(session_id)
+        if not status.ok:
+            return TaskResultResult(False, False, None, None, False, False, status.error)
+
+        mstatus, body, merror = self._http(self._messages_url(session_id, directory))
+        if merror is not None and mstatus is None:
+            return TaskResultResult(False, False, None, None, False, False, merror)
+        if mstatus is None or not (200 <= mstatus < 300):
+            return TaskResultResult(False, False, None, None, False, False, f"http: {mstatus}")
+        try:
+            messages = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return TaskResultResult(False, False, None, None, False, False, "malformed: body is not JSON")
+        if not isinstance(messages, list):
+            return TaskResultResult(False, False, None, None, False, False, "malformed: messages not a list")
+
+        anchor = None
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if isinstance(info, dict) and info.get("id") == user_message_id:
+                anchor = i
+                break
+        if anchor is None:
+            return TaskResultResult(
+                False, False, None, None, False, False, "not_found: user_message_id 未找到"
+            )
+
+        user_created = _num_ts((messages[anchor].get("info") or {}).get("time"), "created")
+        tail = messages[anchor + 1:]
+
+        # 首响应：原任务之后第一条有可见 text 的 assistant；resume 响应不覆盖
+        first_response_ms = None
+        for message in tail:
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if not isinstance(info, dict) or info.get("role") != "assistant" or not _visible_text(message):
+                continue
+            t = _num_ts(info.get("time"), "streamed")
+            if t is None:
+                t = _num_ts(info.get("time"), "created")
+            if t is not None and user_created is not None:
+                first_response_ms = max(0, int(t - user_created))
+            break
+
+        # 防串任务：原任务后出现未知 user message
+        ambiguous = False
+        for message in tail:
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if not isinstance(info, dict):
+                continue
+            if info.get("role") == "user" and info.get("id") not in allowed:
+                ambiguous = True
+                break
+
+        if status.status != "idle":
+            return TaskResultResult(True, False, None, first_response_ms, ambiguous, False, None)
+
+        # idle：收集原任务后的 assistant
+        assistants = [
+            m for m in tail
+            if isinstance(m, dict) and isinstance(m.get("info"), dict) and m["info"].get("role") == "assistant"
+        ]
+        if not assistants:
+            return TaskResultResult(True, False, None, first_response_ms, ambiguous, False, None)
+
+        # complete：取最新一条合格的成功 assistant（finish=stop/completed 数字/无 error/非 summary/有可见 text）
+        complete = False
+        text = None
+        for message in reversed(assistants):
+            info = message["info"]
+            if info.get("finish") != "stop":
+                continue
+            if _num_ts(info.get("time"), "completed") is None:
+                continue
+            if info.get("error"):
+                continue
+            if _is_summary(info):
+                continue
+            if not _visible_text(message):
+                continue
+            complete = True
+            text = _join_visible_text(message)
+            break
+
+        # interrupted：已 idle 且有 assistant，但尾部未形成可安全回传的答案
+        interrupted = False
+        if not complete:
+            tail_info = assistants[-1]["info"]
+            if (
+                _num_ts(tail_info.get("time"), "completed") is None
+                or tail_info.get("error")
+                or tail_info.get("finish") in ("error", "content-filter", "length")
+            ):
+                interrupted = True
+
+        if ambiguous:
+            complete = False
+            text = None
+
+        return TaskResultResult(True, complete, text, first_response_ms, ambiguous, interrupted, None)
+
 
 def _nonempty_str(value) -> str | None:
     if isinstance(value, str) and value.strip():
@@ -481,6 +632,41 @@ def _progress_projection(tail) -> list:
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int((time.perf_counter() - started) * 1000))
+
+
+def _num_ts(time_field, key: str):
+    """取 time dict 里某时间戳（int/float，非 bool）；缺失/非数字 → None。"""
+    if isinstance(time_field, dict):
+        value = time_field.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _visible_text(message: dict) -> bool:
+    """该消息是否至少有一个可见 text part（非空 text 字符串）。"""
+    for part in message.get("parts") or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def _join_visible_text(message: dict) -> str:
+    """只取 parts[].type=="text" 的文本，多个用 "\n\n" 连接；不含 reasoning/tool/system/synthetic。"""
+    texts = [
+        part.get("text")
+        for part in message.get("parts") or []
+        if isinstance(part, dict) and part.get("type") == "text"
+        and isinstance(part.get("text"), str) and part.get("text").strip()
+    ]
+    return "\n\n".join(texts)
+
+
+def _is_summary(info: dict) -> bool:
+    """summary/continuation 合成消息判定（OpenChamber 用 synthetic 标记）。"""
+    return info.get("synthetic") is True or info.get("summary") is True
 
 
 if __name__ == "__main__":

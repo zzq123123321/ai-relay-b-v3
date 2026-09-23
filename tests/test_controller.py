@@ -16,6 +16,7 @@
 from active_session_reader import ActiveSession
 from controller import (
     AUTO_IDLE,
+    AUTO_READY,
     AUTO_MODEL_OFFLINE,
     AUTO_RECOVER_CHECK,
     AUTO_RESUME_SENT,
@@ -31,6 +32,7 @@ from openchamber_client import (
     SendResult,
     SessionStatusResult,
     TaskProgressResult,
+    TaskResultResult,
 )
 
 
@@ -47,6 +49,8 @@ class FakeClient:
         progress=None,
         status_fn=None,
         progress_fn=None,
+        result=None,
+        result_fn=None,
     ) -> None:
         self.validate_result = validate
         self.send_result = send if send is not None else SendResult(True, None, "msg_1")
@@ -58,12 +62,15 @@ class FakeClient:
         self.progress_result = progress if progress is not None else TaskProgressResult(True, "marker0", True)
         self.status_fn = status_fn
         self.progress_fn = progress_fn
+        self.result = result
+        self.result_fn = result_fn
         self.validated = []
         self.sent = []
         self.compacted = []
         self.resolved = []
         self.status_calls = []
         self.progress_calls = []
+        self.result_calls = []
 
     def validate_session(self, session_id, directory=None):
         self.validated.append((session_id, directory))
@@ -95,6 +102,14 @@ class FakeClient:
         if self.progress_fn is not None:
             return self.progress_fn(session_id, directory, user_message_id)
         return self.progress_result
+
+    def get_task_result(self, session_id, directory, message_id, allowed_followup_user_ids=None):
+        self.result_calls.append((session_id, directory, message_id, allowed_followup_user_ids))
+        if self.result_fn is not None:
+            return self.result_fn(session_id, directory, message_id, allowed_followup_user_ids)
+        if self.result is not None:
+            return self.result
+        return TaskResultResult(True, False, None, None, False, False, None)
 
 
 SESSION = ActiveSession(
@@ -611,3 +626,73 @@ def test_idle_still_accepts_new_task():
     assert intake.accepted is True
     assert intake.submitted is True  # 在线 → 直接 RUNNING
     assert client.sent == [("ses_x", r"C:\work", "RAW")]
+
+
+# ===================== L05-03 交付3：结果检查入口 =====================
+
+# 19. resume accepted 后 Controller 保存 resume_message_id
+def test_resume_accepted_saves_resume_message_id():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m_resume"), status=IDLE_ST, progress=PROG_BASE)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert task.resume_message_id is None  # 首次发送后尚未续接
+    task.state = AUTO_RECOVER_CHECK
+    task.recover_baseline = PROG_BASE.marker  # 无进展
+    task.recover_started_ms = 0
+    result = ctrl.watchdog_tick(now_ms=RECOVER_OBSERVE_MS)
+    assert result.action == "resume_sent"
+    assert task.resume_message_id == "m_resume"
+    # resume 用冻结 session，发固定续接
+    assert client.sent[-1] == ("ses_x", r"C:\work", RESUME_PROMPT)
+
+
+# 20. inspect 使用 frozen session，即使 UI active session 已切换也不受影响
+def test_inspect_result_uses_frozen_session():
+    complete = TaskResultResult(True, True, "DONE", 120, False, False, None)
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), result=complete)
+    ctrl = _make_running(client)
+    other = ActiveSession(session_id="ses_other", directory=r"D:\other", source="x")
+    ctrl._read_active_session = lambda: other  # UI 已切到别的会话
+    task = ctrl._auto_task
+    task.resume_message_id = "m_resume"  # 模拟本恢复周期已发过一次续接
+    view = ctrl.inspect_auto_task_result()
+    assert view is complete  # 透传 client 识别结果
+    # 调用用的是冻结目标 + 允许的 resume_message_id，而非 UI 当前会话
+    assert client.result_calls == [("ses_x", r"C:\work", "m1", {"m_resume"})]
+
+
+# 21. inspect complete 后 AutoTask 本轮仍保持原状态，不擅自清为 IDLE
+def test_inspect_does_not_clear_task():
+    complete = TaskResultResult(True, True, "DONE", 120, False, False, None)
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"), result=complete)
+    ctrl = _make_running(client)
+    task = ctrl._auto_task
+    assert task.state == AUTO_RUNNING
+    view = ctrl.inspect_auto_task_result()
+    assert view.complete is True
+    # 本轮只识别，不负责交付/清理：仍持有同一 AutoTask 且状态不变
+    assert ctrl._auto_task is task
+    assert task.state == AUTO_RUNNING
+    assert task.message_id == "m1"
+    assert task.session_id == "ses_x"
+    assert task.directory == r"C:\work"
+
+
+# 补充：无任务 或 还没真正发出（无冻结 message_id）→ complete=False 且不调 client
+def test_inspect_no_task_or_not_sent():
+    client = FakeClient(**ONLINE, send=SendResult(True, None, "m1"))
+    ctrl = _ctrl(client, SESSION)
+    view = ctrl.inspect_auto_task_result()
+    assert view.complete is False
+    assert client.result_calls == []  # 无任务 → 未调用 client
+
+    # 任务仍停在 READY（send 失败，无 message_id）
+    client2 = FakeClient(**ONLINE, send=SendResult(False, "offline", None))
+    ctrl2 = _ctrl(client2, SESSION)
+    ctrl2.receive_auto_task("e1", "RAW", "{content}")
+    task2 = ctrl2._auto_task
+    assert task2.state == AUTO_READY
+    assert task2.message_id is None
+    view2 = ctrl2.inspect_auto_task_result()
+    assert view2.complete is False
+    assert client2.result_calls == []  # 还没真正发出 → 不调 client

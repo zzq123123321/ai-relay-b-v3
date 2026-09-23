@@ -29,6 +29,7 @@ from openchamber_client import (
     SendResult,
     SessionStatusResult,
     TaskProgressResult,
+    TaskResultResult,
 )
 
 
@@ -384,6 +385,257 @@ def test_task_progress_get_failure_read_ok_false(monkeypatch, tmp_path):
     assert result.marker is None
     assert result.user_message_found is False
     assert result.error.startswith("connection:")
+
+
+# --- 交付1/2：get_task_result 最终结果识别 + 首响应 ------------------------
+
+def _user_msg(user_id="u1", created=1000):
+    return {"info": {"id": user_id, "role": "user", "time": {"created": created}},
+            "parts": [{"type": "text", "text": "q"}]}
+
+
+def _asst(msg_id, *, finish="stop", created=None, streamed=None, completed=None,
+          error=None, synthetic=False, parts=None):
+    info = {"id": msg_id, "role": "assistant"}
+    t = {}
+    if created is not None:
+        t["created"] = created
+    if streamed is not None:
+        t["streamed"] = streamed
+    if completed is not None:
+        t["completed"] = completed
+    if t:
+        info["time"] = t
+    if finish is not None:
+        info["finish"] = finish
+    if error is not None:
+        info["error"] = error
+    if synthetic:
+        info["synthetic"] = True
+    return {"info": info, "parts": parts if parts is not None else [{"type": "text", "text": "A"}]}
+
+
+def _result_client(monkeypatch, tmp_path, status_value, messages, status_route=None):
+    routes = [
+        (status_route or "/status",
+         lambda r, s=status_value: FakeResponse(200, _json_body({"status": s}))),
+        ("/message", lambda r: FakeResponse(200, _json_body(messages))),
+    ]
+    client, _ = _client(monkeypatch, tmp_path, routes)
+    return client
+
+
+# 1. busy → complete=False
+def test_result_busy_not_complete(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "busy",
+                            [_user_msg(), _asst("a1", streamed=1100, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is True
+    assert r.complete is False
+    assert r.interrupted is False
+    assert r.ambiguous is False
+
+
+# 2. retry → complete=False
+def test_result_retry_not_complete(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "retry",
+                            [_user_msg(), _asst("a1", streamed=1100, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is True
+    assert r.complete is False
+    assert r.interrupted is False
+
+
+# 3. idle + completed stop assistant + text → complete=True
+def test_result_idle_completed_is_complete(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "idle",
+                            [_user_msg(created=1000), _asst("a1", streamed=1100, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is True
+    assert r.complete is True
+    assert r.text == "A"
+    assert r.interrupted is False
+    assert r.ambiguous is False
+    assert r.first_response_ms == 100  # streamed 1100 - created 1000
+
+
+# 4. 多个 text parts → "\n\n" 拼接
+def test_result_joins_multiple_text_parts(monkeypatch, tmp_path):
+    asst = _asst("a1", streamed=1100, completed=1500,
+                 parts=[{"type": "text", "text": "P1"}, {"type": "text", "text": "P2"}])
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is True
+    assert r.text == "P1\n\nP2"
+
+
+# 5. reasoning/tool 不进入最终 result
+def test_result_excludes_reasoning_tool(monkeypatch, tmp_path):
+    asst = _asst("a1", streamed=1100, completed=1500, parts=[
+        {"type": "reasoning", "text": "R"},
+        {"type": "tool", "text": "T"},
+        {"type": "text", "text": "OK"},
+    ])
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is True
+    assert r.text == "OK"
+
+
+# 6. summary assistant 不作为最终结果
+def test_result_summary_not_final(monkeypatch, tmp_path):
+    asst = _asst("a_sum", finish="stop", streamed=1100, completed=1500, synthetic=True)
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is False
+    assert r.text is None
+    assert r.interrupted is False
+
+
+# 7. idle + unfinished assistant → interrupted=True
+def test_result_idle_unfinished_interrupted(monkeypatch, tmp_path):
+    asst = _asst("a1", finish="stop", streamed=1100, completed=None)  # 无 completed
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is False
+    assert r.interrupted is True
+
+
+# 8. idle + assistant error → interrupted=True
+def test_result_idle_error_interrupted(monkeypatch, tmp_path):
+    asst = _asst("a1", finish="stop", streamed=1100, completed=1500, error="boom")
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is False
+    assert r.interrupted is True
+
+
+# 9. idle + finish=length → interrupted=True
+def test_result_idle_length_interrupted(monkeypatch, tmp_path):
+    asst = _asst("a1", finish="length", streamed=1100, completed=1500)
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg(), asst])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.complete is False
+    assert r.interrupted is True
+
+
+# 10. idle + 尚无 assistant → complete=False, interrupted=False
+def test_result_idle_no_assistant(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "idle", [_user_msg()])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is True
+    assert r.complete is False
+    assert r.interrupted is False
+
+
+# 11a. status 读取失败 → read_ok=False
+def test_result_status_get_failure(monkeypatch, tmp_path):
+    def raise_404(request):
+        raise urllib.error.HTTPError(request.full_url, 404, "nf", {}, io.BytesIO(b""))
+
+    client, _ = _client(monkeypatch, tmp_path, [("/status", raise_404),
+                                                ("/message", lambda r: FakeResponse(200, b"[]"))])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is False
+    assert r.complete is False
+    assert r.error == "http: 404"
+
+
+# 11b. messages 读取失败 → read_ok=False（≠模型没有结果）
+def test_result_messages_get_failure(monkeypatch, tmp_path):
+    def raise_conn(request):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+    client, _ = _client(monkeypatch, tmp_path, [
+        ("/status", lambda r: FakeResponse(200, _json_body({"status": "idle"}))),
+        ("/message", raise_conn),
+    ])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.read_ok is False
+    assert r.complete is False
+    assert r.error.startswith("connection:")
+
+
+# 12. user_message_id 找不到 → read_ok=False
+def test_result_user_message_not_found(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "idle",
+                            [_user_msg(user_id="u1"), _asst("a1", streamed=1100, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u_missing")
+    assert r.read_ok is False
+    assert r.complete is False
+    assert "not_found" in (r.error or "")
+
+
+# 13. 原任务后出现未知 user message → ambiguous=True, complete=False
+def test_result_unknown_user_ambiguous(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _asst("a1", streamed=1100, completed=1500),
+        _user_msg(user_id="u_manual", created=1600),
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.ambiguous is True
+    assert r.complete is False
+
+
+# 14. resume_message_id 在 allowed 集合 → 不算 ambiguous
+def test_result_resume_allowed_not_ambiguous(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _asst("a1", streamed=1100, completed=1500),
+        _user_msg(user_id="resume_msg", created=1600),
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1", allowed_followup_user_ids=["resume_msg"])
+    assert r.ambiguous is False
+    assert r.complete is True
+    assert r.text == "A"
+
+
+# 15. resume 后的最终 assistant → 可识别为原任务最终结果
+def test_result_resume_final_assistant(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _asst("a1", streamed=1100, completed=None),          # 原响应未完成
+        _user_msg(user_id="resume_msg", created=1600),       # 系统自动续接
+        _asst("a2", streamed=2000, completed=2100,
+              parts=[{"type": "text", "text": "final"}]),    # 续接后完成
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1", allowed_followup_user_ids=["resume_msg"])
+    assert r.ambiguous is False
+    assert r.complete is True
+    assert r.text == "final"
+
+
+# 16. first_response 使用 time.streamed
+def test_result_first_response_uses_streamed(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "idle",
+                            [_user_msg(created=1000), _asst("a1", streamed=1400, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.first_response_ms == 400  # streamed 1400 - created 1000
+
+
+# 17. streamed 缺失 → fallback assistant created
+def test_result_first_response_fallback_created(monkeypatch, tmp_path):
+    client = _result_client(monkeypatch, tmp_path, "idle",
+                            [_user_msg(created=1000), _asst("a1", created=1400, completed=1500)])
+    r = client.get_task_result("ses_x", None, "u1")
+    assert r.first_response_ms == 400  # created 1400 - created 1000
+
+
+# 18. first_response 永远基于原任务，resume assistant 不覆盖
+def test_result_first_response_not_overridden_by_resume(monkeypatch, tmp_path):
+    messages = [
+        _user_msg(user_id="u1", created=1000),
+        _asst("a1", streamed=1100, completed=1200),
+        _user_msg(user_id="resume_msg", created=1600),
+        _asst("a2", streamed=2000, completed=2100),
+    ]
+    client = _result_client(monkeypatch, tmp_path, "idle", messages)
+    r = client.get_task_result("ses_x", None, "u1", allowed_followup_user_ids=["resume_msg"])
+    assert r.first_response_ms == 100  # 来自原任务 a1（streamed 1100-1000），非 a2 的 1000
 
 
 if __name__ == "__main__":
