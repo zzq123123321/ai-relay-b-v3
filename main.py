@@ -1,7 +1,7 @@
-"""AI Relay B Lite 应用入口：QApplication → MainWindow → LiteController → wire_ui → show。
+"""AI Relay B Lite 应用入口：QApplication → MainWindow → LiteController + ClipLinkBridge → wire_ui → show。
 
-本轮把 UI 的 signal 接到 LiteController（全 fake 可测）。仍不启动后台
-自动监听 / 自动压缩 / watchdog（那些属于后续阶段的后台 monitor）。
+本轮把 UI 的 signal 接到 LiteController（全 fake 可测）+ ClipLinkBridge（A→B 事件读取、
+B→A 结果回传、AIRelayLite 状态文件）。仍不做自动包装 / 自动发模型 / 自动压缩 / watchdog。
 """
 
 import sys
@@ -9,16 +9,17 @@ import sys
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from cliplink_bridge import ClipLinkBridge
 from cliplink_status import snapshot
 from controller import LiteController
 from ui.main_window import MainWindow
 
 
-def wire_ui(window: MainWindow, controller: LiteController) -> None:
-    """把 MainWindow 的 signal 接到 LiteController。
+def wire_ui(window: MainWindow, controller: LiteController, bridge: ClipLinkBridge) -> None:
+    """把 MainWindow 的 signal 接到 LiteController + ClipLinkBridge。
 
-    全部是用户主动触发的本机同步操作，本轮不引入线程框架；
-    后台自动逻辑（监听/自动压缩/watchdog）统一留给后续 monitor。
+    全部是用户主动触发的本机同步操作 + ClipLink 事件桥接线，本轮不引入线程框架；
+    自动包装 / 模型发送 / 自动压缩 / watchdog 统一留给后续 monitor。
     """
 
     def on_refresh_session() -> None:
@@ -26,21 +27,26 @@ def wire_ui(window: MainWindow, controller: LiteController) -> None:
         if session.valid:
             window.set_current_session(session.session_id)
             window.append_log("已获取当前激活会话")
+            bridge.set_session_id(session.session_id)
         else:
             window.set_current_session(None)
             window.append_log("当前激活会话不可用")
+            bridge.set_session_id(None)
 
     def on_test_model() -> None:
         result = controller.test_model_connection()
         if not result.connected:
             window.set_model_connection("已断开", oc_ms=None, first_response_ms=None)
             window.append_log("OpenChamber 服务不可达" + (f"（{result.error}）" if result.error else ""))
+            bridge.set_model_status("disconnected")
         elif result.ready:
             window.set_model_connection("正常", oc_ms=result.service_latency_ms, first_response_ms=None)
             window.append_log("大模型连接正常")
+            bridge.set_model_status("ready", result.service_latency_ms)
         else:
             window.set_model_connection("服务正常", oc_ms=result.service_latency_ms, first_response_ms=None)
             window.append_log("OpenChamber 服务正常，但当前会话模型配置不可用")
+            bridge.set_model_status("service_only", result.service_latency_ms)
 
     def on_manual_send(text: str) -> None:
         result = controller.manual_send(text)
@@ -57,11 +63,18 @@ def wire_ui(window: MainWindow, controller: LiteController) -> None:
         else:
             window.append_log(f"压缩失败：{result.error}")
 
-    def on_listening(_enabled: bool) -> None:
-        window.append_log("自动监听将在后续阶段接入")
+    def on_listening(enabled: bool) -> None:
+        bridge.set_listening(enabled)
+        window.append_log("自动监听已开始" if enabled else "自动监听已停止")
+
+    def on_remote_task(task) -> None:
+        window.set_current_task("已收到A端任务，等待自动处理")
+        window.append_log("收到 A端新任务")
 
     def on_auto_compact(enabled: bool) -> None:
         window.append_log("自动压缩已设置为" + ("开" if enabled else "关") + "，后台策略将在后续阶段接入")
+
+    bridge.on_remote_task = on_remote_task
 
     window.refresh_session_requested.connect(on_refresh_session)
     window.test_model_requested.connect(on_test_model)
@@ -94,13 +107,30 @@ def start_cliplink_poll(window: MainWindow, interval_ms: int = 2000, path=None) 
     return timer
 
 
+def start_bridge_poll(window: MainWindow, bridge: ClipLinkBridge, interval_ms: int = 400) -> QTimer:
+    """定时驱动 ClipLinkBridge：poll remote event + flush pending + 写状态文件。
+
+    首帧立即 tick 一次，之后每 interval_ms 一轮；计时器挂到 window 下随窗口存活。
+    """
+    timer = QTimer(window)
+    timer.setInterval(interval_ms)
+    timer.timeout.connect(bridge.tick)
+    timer.start()
+    bridge.tick()
+    return timer
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("AI Relay B Lite")
     window = MainWindow()
     controller = LiteController()
-    wire_ui(window, controller)
+    bridge = ClipLinkBridge(
+        clipboard_writer=lambda text: QApplication.clipboard().setText(text),
+    )
+    wire_ui(window, controller, bridge)
     start_cliplink_poll(window)
+    start_bridge_poll(window, bridge)
     window.show()
     sys.exit(app.exec())
 

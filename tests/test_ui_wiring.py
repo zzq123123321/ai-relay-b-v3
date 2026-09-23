@@ -1,18 +1,21 @@
-"""UI ↔ LiteController 接线测试（全 fake，offscreen，禁止真实 HTTP）。
+"""UI ↔ LiteController + ClipLinkBridge 接线测试（全 fake，offscreen，禁止真实 HTTP）。
 
-用 FakeController 覆盖 main.wire_ui 的全部接线分支：
- 1 refresh session 成功 → 当前会话 label 更新
- 2 refresh session 失败 → 显示"无"
- 3 model test ready → "正常" + 服务延迟
- 4 model 在线但不可 ready → "服务正常" + 说明日志
- 5 model 服务断开 → "已断开" + 服务延迟 --
- 6 manual send → controller 收到完全原样 text
- 7 manual accepted → 日志正确且不更新最近结果
- 8 manual failed → 日志显示错误
- 9 compact success → 日志成功
-10 compact failure → 日志错误
-11 listening_changed → 不启动任何真实后台服务（占位日志）
-12 auto_compact_changed → 不调用 compact_session
+用 FakeController + FakeBridge 覆盖 main.wire_ui 的全部接线分支：
+  1 refresh session 成功 → 当前会话 label 更新
+  2 refresh session 失败 → 显示"无"
+  3 model test ready → "正常" + 服务延迟
+  4 model 在线但不可 ready → "服务正常" + 说明日志
+  5 model 服务断开 → "已断开" + 服务延迟 --
+  6 manual send → controller 收到完全原样 text
+  7 manual accepted → 日志正确且不更新最近结果
+  8 manual failed → 日志显示错误
+  9 compact success → 日志成功
+ 10 compact failure → 日志错误
+ 11 listening_changed → bridge.set_listening() 被调用 + 日志
+ 12 auto_compact_changed → 不调用 compact_session
+ 13 remote task → UI 更新 + 不调用模型发送
+ 14 refresh session → bridge.set_session_id() 被调用
+ 15 test model → bridge.set_model_status() 被调用
 """
 
 import json
@@ -24,9 +27,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
+from cliplink_bridge import ClipLinkBridge, RemoteTask
 from cliplink_status import now_millis
 from controller import CurrentSession, LiteController, ModelConnectionResult
-from main import apply_cliplink_status, start_cliplink_poll, wire_ui
+from main import apply_cliplink_status, start_bridge_poll, start_cliplink_poll, wire_ui
 from openchamber_client import CompactResult, SendResult
 from ui.main_window import MainWindow
 
@@ -61,16 +65,38 @@ class FakeController:
         return self._compact
 
 
+class FakeBridge:
+    """ClipLinkBridge 的替身：记录调用，不读写真实文件。"""
+
+    def __init__(self) -> None:
+        self.listening_calls: list[bool] = []
+        self.session_ids: list[str | None] = []
+        self.model_statuses: list[tuple] = []
+        self.on_remote_task = None
+
+    def set_listening(self, enabled: bool) -> None:
+        self.listening_calls.append(enabled)
+
+    def set_session_id(self, session_id: str | None) -> None:
+        self.session_ids.append(session_id)
+
+    def set_model_status(self, status: str, latency_ms: int | None = None) -> None:
+        self.model_statuses.append((status, latency_ms))
+
+    def tick(self) -> None:
+        pass
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
 
 
-def _wired(qapp, controller):
+def _wired(qapp, controller, bridge=None):
     w = MainWindow()
     w.show()
-    wire_ui(w, controller)
+    wire_ui(w, controller, bridge if bridge is not None else FakeBridge())
     return w
 
 
@@ -170,13 +196,18 @@ def test_compact_failure_logs(qapp):
     assert "http: 404" in _log(w)
 
 
-def test_listening_changed_no_background_service(qapp):
+def test_listening_changed_calls_bridge_and_logs(qapp):
     fake = FakeController()
-    w = _wired(qapp, fake)
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
     w.listening_changed.emit(True)
-    assert "自动监听将在后续阶段接入" in _log(w)
-    assert fake.compact_calls == 0  # 未启动任何后台 worker，未触发压缩
+    assert bridge.listening_calls == [True]
+    assert "自动监听已开始" in _log(w)
+    assert fake.compact_calls == 0
     assert fake.sent_texts == []
+    w.listening_changed.emit(False)
+    assert bridge.listening_calls == [True, False]
+    assert "自动监听已停止" in _log(w)
 
 
 def test_auto_compact_does_not_call_compact(qapp):
@@ -186,6 +217,51 @@ def test_auto_compact_does_not_call_compact(qapp):
     w.auto_compact_changed.emit(False)
     assert fake.compact_calls == 0  # 只是切换 UI 状态，不真正压缩
     assert "自动压缩已设置为开，后台策略将在后续阶段接入" in _log(w)
+
+
+def test_remote_task_updates_ui_without_model(qapp):
+    fake = FakeController()
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.listening_changed.emit(True)
+    task = RemoteTask("evt_new", "A端任务内容", "hash1", 12345)
+    bridge.on_remote_task(task)
+    assert _box(w, "task_box") == "已收到A端任务，等待自动处理"
+    assert "收到 A端新任务" in _log(w)
+    assert fake.sent_texts == []
+    assert fake.compact_calls == 0
+
+
+def test_refresh_session_calls_bridge_set_session_id(qapp):
+    fake = FakeController(session=CurrentSession("ses_abc", r"C:\w", "src", True, None))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.refresh_session_requested.emit()
+    assert bridge.session_ids == ["ses_abc"]
+
+
+def test_refresh_session_failure_sets_session_id_none(qapp):
+    fake = FakeController(session=CurrentSession(None, None, None, False, "不可用"))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.refresh_session_requested.emit()
+    assert bridge.session_ids == [None]
+
+
+def test_model_test_calls_bridge_set_model_status(qapp):
+    fake = FakeController(model_result=ModelConnectionResult(True, 15, True, None))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.test_model_requested.emit()
+    assert bridge.model_statuses == [("ready", 15)]
+
+
+def test_model_disconnected_calls_bridge(qapp):
+    fake = FakeController(model_result=ModelConnectionResult(False, None, False, "timeout"))
+    bridge = FakeBridge()
+    w = _wired(qapp, fake, bridge)
+    w.test_model_requested.emit()
+    assert bridge.model_statuses == [("disconnected", None)]
 
 
 # --- A端连接卡 ← ClipLink status.json 接线（全 tmp 文件，offscreen）-----
