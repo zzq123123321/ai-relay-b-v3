@@ -21,8 +21,10 @@ import pytest
 from active_session_reader import (
     ActiveSession,
     parse_last_session_value,
+    parse_session_activity_value,
     read_active_session,
     read_last_session_value,
+    read_session_activity_value,
 )
 from openchamber_client import OpenChamberClient
 
@@ -135,6 +137,122 @@ def test_directory_empty_string_becomes_none():
     result = parse_last_session_value(raw)
     assert result is not None
     assert result.directory is None
+
+
+# --- 新格式：oc.session-activity.v1（OpenChamber >= 1.18.31）------------
+
+_ACT_KEY = b"\x01oc.session-activity.v1"
+
+
+def _activity_bytes(*pairs) -> bytes:
+    """pairs: (session_id, seen, start)；构造 activity 键 + JSON 值（缺省字段省略）。"""
+    obj: dict = {}
+    for session_id, seen, start in pairs:
+        entry: dict = {}
+        if start is not None:
+            entry["start"] = start
+        if seen is not None:
+            entry["seen"] = seen
+        obj[session_id] = entry
+    return _ACT_KEY + json.dumps(obj).encode("utf-8")
+
+
+def test_activity_valid_session(tmp_path):
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _activity_bytes(("ses_act", 100, 90))})
+    result = read_active_session(tmp_path)
+    assert isinstance(result, ActiveSession)
+    assert result.session_id == "ses_act"
+    assert result.directory is None
+    assert result.source == "session-activity"
+
+
+def test_activity_picks_max_seen(tmp_path):
+    # 多会话：seen 最大 = 最近激活；历史会话 seen 更小，不被误选
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _activity_bytes(("ses_hist", 100, 10), ("ses_active", 500, 400))})
+    result = read_active_session(tmp_path)
+    assert result is not None
+    assert result.session_id == "ses_active"
+
+
+def test_activity_falls_back_to_start_when_no_seen(tmp_path):
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _activity_bytes(("ses_a", None, 10), ("ses_b", None, 99))})
+    result = read_active_session(tmp_path)
+    assert result is not None
+    assert result.session_id == "ses_b"
+
+
+def test_activity_empty_map_returns_none(tmp_path):
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _ACT_KEY + b"{}"})
+    assert read_active_session(tmp_path) is None
+
+
+def test_activity_non_dict_value_returns_none(tmp_path):
+    # 值是数组而非对象 → 无法解析成 {sessionId: {...}}
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _ACT_KEY + b'["ses_x"]'})
+    assert read_active_session(tmp_path) is None
+
+
+def test_activity_entry_without_seen_or_start_returns_none(tmp_path):
+    # 唯一条目缺 seen 且缺 start → 无法确定"最近" → None（不猜）
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _ACT_KEY + b'{"ses_x":{}}'})
+    assert read_active_session(tmp_path) is None
+
+
+def test_activity_wal_overrides_sst(tmp_path):
+    # .ldb 旧 activity 值 A，.log 新 activity 值 B → 取 B（内存表最新）
+    _write_dir(
+        tmp_path,
+        {
+            "000010.ldb": b"x" + _activity_bytes(("ses_old", 1, 1)),
+            "000020.log": b"x" + _activity_bytes(("ses_new", 2, 2)),
+        },
+    )
+    result = read_active_session(tmp_path)
+    assert result is not None
+    assert result.session_id == "ses_new"
+
+
+def test_activity_overrides_legacy(tmp_path):
+    # 同文件同时含 activity 与 legacy 键 → 优先 activity（新格式）
+    _write_dir(
+        tmp_path,
+        {"000003.ldb": b"p" + _value_bytes("ses_legacy", "D:/old") + _activity_bytes(("ses_act", 5, 4))},
+    )
+    result = read_active_session(tmp_path)
+    assert result is not None
+    assert result.session_id == "ses_act"
+    assert result.source == "session-activity"
+
+
+def test_activity_missing_falls_back_to_legacy(tmp_path):
+    # 仅 legacy 键、无 activity 键 → 回退旧格式（回归，确认未被新逻辑破坏）
+    _write_dir(tmp_path, {"000003.ldb": b"p" + _value_bytes("ses_legacy", "D:/old")})
+    result = read_active_session(tmp_path)
+    assert result is not None
+    assert result.session_id == "ses_legacy"
+    assert result.directory == "D:/old"
+    assert result.source == "persisted-last-active"
+
+
+def test_parse_activity_multiple_picks_max_seen():
+    raw = '{"ses_a":{"start":1,"seen":5},"ses_b":{"start":9,"seen":99}}'
+    r = parse_session_activity_value(raw)
+    assert r is not None
+    assert r.session_id == "ses_b"
+    assert r.directory is None
+    assert r.source == "session-activity"
+
+
+def test_parse_activity_none_and_invalid():
+    assert parse_session_activity_value(None) is None
+    assert parse_session_activity_value(b"{not json") is None
+    assert parse_session_activity_value(b"[]") is None
+
+
+def test_parse_activity_bytes_valid():
+    r = parse_session_activity_value(b'{"ses_x":{"seen":1}}')
+    assert r is not None
+    assert r.session_id == "ses_x"
 
 
 # --- runtime 选择 -------------------------------------------------------
