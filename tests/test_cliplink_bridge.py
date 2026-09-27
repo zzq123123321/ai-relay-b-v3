@@ -116,32 +116,39 @@ def test_03_text_preserved_verbatim(tmp_path):
 # ── 4-8: listening / baseline / 去重 ──────────────────────────────
 
 
-def test_04_existing_event_triggers_once_after_listening(tmp_path):
-    """已存在未消费事件，B 开监听后必须触发（回归③验收①）；消费后绝不重复触发。"""
+def test_04_existing_event_dropped_when_listening_starts(tmp_path):
+    """已存在未消费事件：B 开始监听时被作废、不投递（新语义 §25）；
+    开启后新到达事件正常投递，消费后绝不重复触发。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="evt1")
-    b = _bridge(tmp_path)
-    b.set_listening(True)
-    task = b.poll()
-    assert task is not None and task.event_id == "evt1"
-    # poll 纯检测不标 consumed：交付前反复 poll 都拿到同一未消费事件
-    assert b.poll() is not None
-    b.on_remote_task = lambda t: None
+    b = _bridge(tmp_path)  # 启动快照把 evt1 导入队列
+    assert b.queue_size() == 1
+    b.set_listening(True)  # 新语义：开始前积压作废
+    assert b.queue_size() == 0
+    b.on_remote_task = lambda t: "ignored"
     b.tick()
-    assert b.poll() is None
+    assert b.queue_size() == 0  # 未投递
+    b.enqueue_remote_task(RemoteTask("evt2", "new", "h", 2000))  # 开启后新帧
+    b.tick()
+    assert b._last_consumed_event_id == "evt2"
 
 
 def test_05_same_event_id_not_retriggered(tmp_path):
-    """同一 event_id 已消费后，重写该事件绝不重复触发（回归③验收②）。"""
+    """同一 event_id 已消费后绝不重执行：重启时快照仍是该帧，导入即跳过（回归③验收②）。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="evt1", text="first")
     b = _bridge(tmp_path)
-    b.set_listening(True)
-    b.on_remote_task = lambda t: None
-    b.tick()  # 首次消费
-    _write_remote_event(p, event_id="evt1", text="second")
-    assert b.poll() is None
-    b.tick()  # 重写后仍不重复触发
+    b.set_listening(True)  # evt1 作废
+    b.on_remote_task = lambda t: "ignored"
+    b.enqueue_remote_task(RemoteTask("evt2", "second", "h", 2000))
+    b.tick()  # 投递 evt2 → consumed=evt2
+    _write_remote_event(p, event_id="evt2", text="second")  # 快照仍为 evt2
+    b2 = _bridge(tmp_path)  # 重启：evt2 == last_consumed → 导入跳过
+    b2.set_listening(True)
+    b2.on_remote_task = lambda t: "ignored"
+    b2.tick()
+    assert b2.queue_size() == 0  # 绝不重执行
+    assert b2._last_consumed_event_id == "evt2"
 
 
 def test_06_new_event_id_triggers_once(tmp_path):
@@ -175,17 +182,22 @@ def test_08_not_listening_no_trigger(tmp_path):
     assert b.poll() is None
 
 
-def test_08b_relistening_does_not_rebaseline_unconsumed_triggers(tmp_path):
-    """重新监听不去重化：未消费的新事件（evt2）仍会触发一次（回归③验收④）。"""
+def test_08b_relistening_drops_queued_events(tmp_path):
+    """队列帧（含监听关闭期间新 sink 帧）重新监听时全部作废、不投递（新语义 §25）；
+    开启后新帧正常投递。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="evt1")
     b = _bridge(tmp_path)
-    b.set_listening(True)
+    b.set_listening(True)  # evt1（快照导入）作废
     b.set_listening(False)
-    _write_remote_event(p, event_id="evt2")
-    b.set_listening(True)
-    task = b.poll()
-    assert task is not None and task.event_id == "evt2"
+    b.enqueue_remote_task(RemoteTask("evt2", "new", "h", 2000))  # 关闭期间新帧
+    b.set_listening(True)  # 新语义：全部作废
+    b.on_remote_task = lambda t: "ignored"
+    b.tick()
+    assert b.queue_size() == 0
+    b.enqueue_remote_task(RemoteTask("evt3", "later", "h3", 3000))  # 开启后新帧
+    b.tick()
+    assert b._last_consumed_event_id == "evt3"
 
 
 # ── 9: A 掉线不影响 inbound ───────────────────────────────────────
@@ -490,10 +502,13 @@ def test_fix2_02_tick_marks_consumed_after_callback_success(tmp_path):
     """on_remote_task 正常返回后才标 consumed；同事件绝不重复投递。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="evt1")
-    b = _bridge(tmp_path)
+    b = _bridge(tmp_path)  # 启动导入 evt1（开始时作废，新语义 §25）
     b.set_listening(True)
     seen: list[str] = []
     b.on_remote_task = lambda t: seen.append(t.event_id)
+    b.tick()
+    assert seen == []  # 启动导入的 evt1 已作废，未投递
+    b.enqueue_remote_task(RemoteTask("evt1", "hello", "abc123", 1000))  # A 重发同事件
     b.tick()
     assert seen == ["evt1"]
     assert b.poll() is None
@@ -507,6 +522,7 @@ def test_fix2_03_tick_callback_failure_keeps_unconsumed(tmp_path):
     _write_remote_event(p, event_id="evt1")
     b = _bridge(tmp_path)
     b.set_listening(True)
+    b.enqueue_remote_task(RemoteTask("evt1", "hello", "abc123", 1000))  # 开启后帧
 
     def boom(t):
         raise RuntimeError("callback failed")
@@ -542,23 +558,24 @@ def test_fix2_04_last_consumed_event_id_persisted_to_status_file(tmp_path):
 
 def test_fix2_05_restart_restores_consumed_state(tmp_path):
     """重启（新实例）恢复 last_consumed_event_id：
-    已消费事件绝不重复执行；未消费事件重启后仍会执行一次。"""
+    已消费事件绝不重复执行；未消费事件重启时导入，（自动）开始监听时
+    作废不执行（新语义 §25）。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="evt1")
     b1 = _bridge(tmp_path)
     b1.set_listening(True)
-    # b1 不 tick：evt1 保持未消费
-    b2 = _bridge(tmp_path)  # “重启”
+    b1.on_remote_task = lambda t: "ignored"
+    b1.enqueue_remote_task(RemoteTask("evt1", "hello", "abc123", 1000))
+    b1.tick()  # 投递并持久化 consumed=evt1
+    b2 = _bridge(tmp_path)  # “重启”：evt1 == last_consumed → 导入跳过
     b2.set_listening(True)
-    task = b2.poll()
-    assert task is not None and task.event_id == "evt1"  # 未消费仍触发
-    b2.on_remote_task = lambda t: None
-    b2.tick()  # 消费并持久化
-    b3 = _bridge(tmp_path)  # 再次“重启”
-    b3.set_listening(True)
-    assert b3.poll() is None  # 已消费恢复，不重复执行
+    b2.on_remote_task = lambda t: "ignored"
+    b2.tick()
+    assert b2.queue_size() == 0  # 已消费绝不重执行
     _write_remote_event(p, event_id="evt2", text="new")
-    assert b3.poll() is not None  # 新事件仍正常工作
+    b2.enqueue_remote_task(RemoteTask("evt2", "new", "h2", 2000))  # 新事件（开启后帧）
+    b2.tick()
+    assert b2._last_consumed_event_id == "evt2"  # 新事件仍正常工作
 
 
 def test_fix2_06_restore_missing_or_corrupt_status_file(tmp_path):
@@ -879,10 +896,11 @@ def test_3f2_runtime_stale_snapshot_not_reinjected(tmp_path):
     """运行时陈旧快照（已消费事件仍驻文件）不再重注入/重执行。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="F1", text="t1")
-    b = _bridge(tmp_path)  # 启动导入 F1
+    b = _bridge(tmp_path)  # 启动导入 F1（开始时作废；投递经开启后帧）
     b.set_listening(True)
     seen: list[str] = []
     b.on_remote_task = lambda t: seen.append(t.event_id) or "submitted"
+    b.enqueue_remote_task(_rt("F1", "t1"))  # 开启后同事件经 sink 到达
     b.tick()  # F1 投递
     assert seen == ["F1"]
     b.resolve_inflight("F1", True)  # 终态；文件里仍是 F1（陈旧快照）
@@ -893,24 +911,24 @@ def test_3f2_runtime_stale_snapshot_not_reinjected(tmp_path):
     b.resolve_inflight("F2", True)
 
 
-def test_3f2_startup_snapshot_before_new_frame(tmp_path):
-    """启动旧快照先于新帧：旧 F0 排在新 F1 之前，先投递。"""
+def test_3f2_startup_snapshot_dropped_then_new_frame(tmp_path):
+    """启动导入的旧快照随（自动）开始监听作废（新语义 §25）；其后新帧正常投递。"""
     p = tmp_path / "remote_clipboard.json"
     _write_remote_event(p, event_id="F0", text="old")
     b = _bridge(tmp_path)  # __init__ 导入 F0
-    b.set_listening(True)
+    assert b.queue_size() == 1
+    b.set_listening(True)  # 新语义：F0 作废
+    assert b.queue_size() == 0
     seen: list[str] = []
     b.on_remote_task = lambda t: seen.append(t.event_id) or "ignored"
     b.enqueue_remote_task(_rt("F1", "new"))  # start() 后新帧经 sink 到达
     b.tick()
-    assert seen == ["F0"]  # 旧快照先投递
-    b.tick()
-    assert seen == ["F0", "F1"]
+    assert seen == ["F1"]
 
 
-def test_3f2_complete_bypass_inflight_and_keeps_queue(tmp_path):
+def test_3f2_complete_bypass_inflight_and_drops_queue_on_relisten(tmp_path):
     """COMPLETE 控制事件旁路在途闸门：B 在途（busy 循环）时 C 立即被处理停监听；
-    B 在途不被中断；D 保留等待；重开监听后从队首继续，COMPLETE 不重投。"""
+    B 在途不被中断；D 重新监听时作废（新语义 §25）不重投，COMPLETE 不重投。"""
     b = _bridge(tmp_path)
     b.set_listening(True)
     seen: list[str] = []
@@ -934,9 +952,10 @@ def test_3f2_complete_bypass_inflight_and_keeps_queue(tmp_path):
     assert b.inflight_attempt is not None  # B 在途不被 COMPLETE 中断
     assert b.queue_size() == 1  # D 保留等待
     b.resolve_inflight("B", True)  # B 终态（活动任务结果回传不被 COMPLETE 中断）
-    b.set_listening(True)
-    b.tick()  # 重新监听：D 从队首继续（COMPLETE 不重投）
-    assert seen == ["B", "C", "D"]
+    b.set_listening(True)          # 新语义：D 作废
+    assert b.queue_size() == 0
+    b.tick()  # 重新监听：D 不重投（COMPLETE 也不重投）
+    assert seen == ["B", "C"]
     assert b._last_consumed_event_id == "B"  # 末次终态=B；C 的 consumed 标记已在旁路时持久化
 
 
@@ -967,21 +986,25 @@ def test_3f2_precommit_exception_requeues_and_raises(tmp_path):
     assert b._last_consumed_event_id == "E1"
 
 
-def test_3f2_not_listening_keeps_queue_resume_dispatches(tmp_path):
-    """监听关闭期间队列保留（含 sink 新帧）；重新监听后从队首继续。"""
+def test_3f2_not_listening_queue_dropped_on_resume(tmp_path):
+    """监听关闭期间不投递；重新开始时等待帧（含新 sink 帧）全部作废（新语义 §25）；
+    开启后新帧正常投递。"""
     b = _bridge(tmp_path)
     b.set_listening(True)
     seen: list[str] = []
     b.on_remote_task = lambda t: seen.append(t.event_id) or "ignored"
     b.enqueue_remote_task(_rt("A"))
     b.set_listening(False)
-    b.enqueue_remote_task(_rt("B"))  # 关闭期间新帧仍入队
+    b.enqueue_remote_task(_rt("B"))  # 关闭期间新帧仍入队（不投递）
     b.tick()
     assert seen == []  # 未监听：不投递
-    b.set_listening(True)
+    b.set_listening(True)  # 新语义：A、B 作废
     b.tick()
     b.tick()
-    assert seen == ["A", "B"]
+    assert seen == []
+    b.enqueue_remote_task(_rt("C"))  # 开启后新帧
+    b.tick()
+    assert seen == ["C"]
 
 
 def test_3f2_enqueued_by_worker_thread_is_thread_safe(tmp_path):

@@ -10,6 +10,9 @@ B→A 结果回传（单槽 pending）、AIRelayLite 状态文件。
 - 文件快照只在启动时导入一次（__init__ → import_snapshot），生产实时不再每 tick
   从文件注入（避免陈旧文件重放）；poll() 保留为兼容/显式快照读取。
 - 既有 COMPLETE 控制事件（is_control_event）旁路在途闸门，不被 busy 普通任务长期挡住。
+- 开始监听清空等待队列（2026-09-27 用户裁决，总纲 §25）：set_listening(True) 时
+  开始前（含启动快照导入）已积压的任务全部作废、不再投递；仅处理监听开启后
+  新到达的 A 端任务。停止监听（False）不清队列。
 """
 
 from __future__ import annotations
@@ -153,7 +156,8 @@ def default_status_file_path() -> Path:
 def _restore_consumed_event_id(status_file: Path) -> str | None:
     """从状态文件恢复 last_consumed_event_id：文件缺失 / 损坏 / 非 str → None（按未消费处理）。
 
-    B 端重启后：已消费事件绝不重复执行；未消费事件仍会执行一次。
+    B 端重启后：已消费事件绝不重复执行；未消费事件重启时导入队列，但（自动）
+    开始监听时随等待队列作废、不执行（总纲 §25）。
     """
     try:
         obj = json.loads(status_file.read_text(encoding="utf-8-sig"))
@@ -242,10 +246,28 @@ class ClipLinkBridge:
             return None
         return RemoteTask(event_id, text, content_hash, int(updated_at))
 
-    def set_listening(self, enabled: bool) -> None:
+    def set_listening(self, enabled: bool) -> int:
+        """切换监听开关；开始时清空开始前积压的等待队列（总纲 §25 新语义）。
+
+        点击“开始监听”之前收到的任务（含启动快照导入）全部作废、不再执行；
+        仅处理监听开启后新到达的 A 端任务。停止监听（enabled=False）不清队列。
+        返回作废的等待条数（停止时恒为 0）；不影响在途任务。
+        """
         self._listening = enabled
+        dropped = 0
+        if enabled:
+            with self._queue_lock:
+                dropped = len(self._queue)
+                for task in self._queue:
+                    # 作废任务不会再投递，其 pending 指纹同步移除：A 端重发相同
+                    # 内容时可作为新任务再执行（不加入 accepted，绝不视为已执行过）
+                    fingerprint = task_fingerprint(task.text)
+                    if fingerprint is not None:
+                        self._pending_task_fingerprints.discard(fingerprint)
+                self._queue.clear()
         self._refresh_relay_status()
         self.write_status_file()
+        return dropped
 
     def poll(self) -> RemoteTask | None:
         """兼容/显式快照读取：读当前快照文件，返回未消费事件（纯检测，无副作用）。
@@ -265,7 +287,8 @@ class ClipLinkBridge:
         """事件到达终态（accepted 回执 / ignored）后，记录并持久化 last_consumed_event_id。
 
         busy 不是终态：回队首不在此记录。持久化保证 B 重启后已消费事件（同
-        event_id）绝不重复执行；未消费事件重启后仍会执行一次（启动快照导入）。
+        event_id）绝不重复执行；未消费事件重启时导入队列，（自动）开始监听时
+        作废不执行（总纲 §25）。
         """
         self._last_consumed_event_id = event_id
         self.write_status_file()
@@ -293,6 +316,8 @@ class ClipLinkBridge:
 
         只在 __init__ 执行一次：文件至多含最新 1 帧；event_id 已消费 → 跳过。
         须在 client.start() 之前完成（main.py 启动顺序），保证旧快照先于新帧入队。
+        导入的候选在监听开始前入队；启动自动开始监听（initialize_startup）会将其
+        随等待队列作废（总纲 §25），不投递。
         陈旧/歧义恢复不宣称可靠：单槽快照最多救回最新 1 帧，连续 sink 失败不保证。
         """
         if self._snapshot_imported:
@@ -527,7 +552,8 @@ class ClipLinkBridge:
         """GUI 线程每轮：控制事件旁路 → 队首投递（受监听与在途闸门）→ 回传 flush → 状态心跳。
 
         生产实时入站来自 sink 队列（网络线程入队），不再从快照文件注入；
-        监听关闭期间队列保留，重新监听后从队首继续投递。
+        监听关闭期间队列保留（不投递）；重新开始时清空等待队列，
+        仅处理之后新到达的任务（总纲 §25）。
         """
         if self._listening:
             self._dispatch_control_bypass()

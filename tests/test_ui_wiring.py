@@ -2037,10 +2037,11 @@ def test_3f2_submit_then_ui_error_no_double_submit(qapp, tmp_path):
     assert len(client.sent) == 1
 
 
-def test_3f2_complete_bypass_busy_and_queue_continues_on_relisten(qapp, tmp_path):
+def test_3f2_complete_bypass_busy_and_queue_dropped_on_relisten(qapp, tmp_path):
     # COMPLETE 不被 busy 普通任务长期挡住：B 反复 busy 时，C=COMPLETE
     # 经控制旁路立即停监听（B 在途保留、D 排队）；A 活动任务结果回传不被中断；
-    # 重新监听后队列从队首继续，COMPLETE 不重投。
+    # 重新监听时等待任务全部作废（新语义 §25），仅处理监听开启后新到达的任务；
+    # COMPLETE 不重投。
     from openchamber_client import TaskResultResult
 
     ch = _real_chain(tmp_path)
@@ -2086,20 +2087,25 @@ def test_3f2_complete_bypass_busy_and_queue_continues_on_relisten(qapp, tmp_path
     assert ch["controller"]._auto_task is None
     assert bridge.queue_size() == 2  # B、D 保留等待（停止监听不清队列）
 
-    # 重新监听：队列从队首 B 继续；COMPLETE 不重投
+    # 重新监听（新语义 §25）：B、D 全部作废，仅处理监听开启后新到达的任务
     w.set_listening(True)
+    assert bridge.queue_size() == 0
     bridge.tick()
-    ch["monitor"].run_once()  # B accepted
-    assert "任务B" in ch["client"].sent[-1][2]
-    process_monitor_events(ch["monitor"], w, bridge)
-    assert "evt-C" not in seen_ids[seen_ids.index("evt-C") + 1:]  # C 不重投
-    ch["client"].result = TaskResultResult(True, True, "结果B", 10, False, False, None)
     ch["monitor"].run_once()
-    process_monitor_events(ch["monitor"], w, bridge)  # B 写成功 → ack
-    ch["monitor"].run_once()  # B finish
-    bridge.tick()
-    ch["monitor"].run_once()  # D 才轮到
-    assert "任务D" in ch["client"].sent[-1][2]
+    process_monitor_events(ch["monitor"], w, bridge)
+    assert len(ch["client"].sent) == 1  # B、D 未执行，仅 task-A 发过
+    assert "evt-C" not in seen_ids[seen_ids.index("evt-C") + 1:]  # C 不重投
+    # 仅处理监听开启后新到达的 A 端任务
+    _push_remote(bridge, ch["remote"], "evt-E", _task_envelope("task-E", "任务E"))
+    ch["monitor"].run_once()  # A 已结束无在途阻挡：E 接管 + 首发送
+    process_monitor_events(ch["monitor"], w, bridge)
+    assert "任务E" in ch["client"].sent[-1][2]
+    ch["client"].result = TaskResultResult(True, True, "结果E", 10, False, False, None)
+    ch["monitor"].run_once()
+    process_monitor_events(ch["monitor"], w, bridge)  # E 写成功 → ack
+    ch["monitor"].run_once()  # E finish
+    process_monitor_events(ch["monitor"], w, bridge)
+    assert ch["controller"]._auto_task is None
+    assert bridge.queue_size() == 0  # B、D 作废未重投
     sent_texts = [s[2] for s in ch["client"].sent]
-    assert "任务A" in sent_texts[0] and "任务B" in sent_texts[1] and "任务D" in sent_texts[2]
-    assert ch["bridge"].queue_size() == 0
+    assert "任务A" in sent_texts[0] and "任务E" in sent_texts[1]  # B、D 从未发出

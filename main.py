@@ -175,8 +175,12 @@ def wire_ui(
             window.append_log(f"压缩失败：{result.error}")
 
     def on_listening(enabled: bool) -> None:
-        bridge.set_listening(enabled)
-        window.append_log("自动监听已开始" if enabled else "自动监听已停止")
+        dropped = bridge.set_listening(enabled) or 0
+        if enabled:
+            message = "自动监听已开始" if dropped == 0 else f"自动监听已开始；开始前到达的 {dropped} 条等待消息作废"
+        else:
+            message = "自动监听已停止"
+        window.append_log(message)
 
     def on_remote_task(task) -> str:
         # A端任务到达（Bridge 入站 FIFO 在 GUI 线程投递）。返回值契约：
@@ -201,7 +205,7 @@ def wire_ui(
                 window.append_log("已忽略普通剪贴板内容（非完整 AI_RELAY 包）")
             return "ignored"
         # 交付1: 严格识别完整包内 AI_RELAY_COMPLETE（包装之前，绝不发给 OpenChamber）。
-        # 只停 inbound 监听（保留等待任务，重新监听后继续投递）；不 stop monitor 线程 /
+        # 只停 inbound 监听（等待任务重新开始时作废）；不 stop monitor 线程 /
         # 不清 Controller 任务 / 不关 ClipLink / 不中断活动任务的结果回传。
         if payload.strip() == "AI_RELAY_COMPLETE":
             window.set_current_task("项目已完成，自动联动已停止")
@@ -353,7 +357,7 @@ def start_bridge_poll(window: MainWindow, bridge: ClipLinkBridge, interval_ms: i
         bridge.tick()
         waiting = bridge.queue_size()
         if waiting and not window._listening and waiting != last_waiting:
-            message = f"已收到 A端消息，自动监听未开启（等待 {waiting} 条）；点击“开始监听”后处理"
+            message = f"已收到 A端消息，自动监听未开启（等待 {waiting} 条）；这些消息开始监听后作废，仅处理监听开启后新到达的任务"
             window.set_current_task(message)
             window.append_log(message)
         last_waiting = waiting
