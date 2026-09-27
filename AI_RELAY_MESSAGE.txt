@@ -1,0 +1,121 @@
+﻿L05-06 RESULT
+
+task_id:
+L05-06-20260924
+
+start_head:
+6ffe5e23c8e4e2378117f0366e7ccb1cadc611d9
+
+compact_controller_api:
+LiteController.compact_auto_task(event_id) -> CompactResult
+
+compact_target_source:
+AutoTask.session_id + AutoTask.directory（首次 accepted 后冻结的原执行会话）
+
+active_session_reader_used:
+False（compact_auto_task 只读冻结的 session_id/directory，不调 _current_session()/get_current_session()/active_session_reader）
+
+auto_compact_default:
+False（OFF；运行时字段，不持久化、不增配置文件）
+
+auto_compact_command:
+("set_auto_compact", True/False) — GUI 线程只入队，worker 收到后更新 _auto_compact_enabled；GUI 主线程 0 HTTP
+
+auto_compact_runtime_semantics:
+用 worker 处理 result acknowledge 时的最新开关值（运行时策略，不冻结到任务创建时：开始 ON 完成前切 OFF → 不压；开始 OFF 完成前切 ON → 压）
+
+ack_order:
+1 验证 event_id == _active_event_id → 2 (auto_compact ON) compact_auto_task(event_id) → 3 按结果发 compact_success/failed 事件 → 4 finish_auto_task(event_id) → 5 释放成功 reset flags
+
+compact_before_finish:
+True（worker 内 compact 严格先于 finish）
+
+result_already_handed_to_bridge:
+True（result_complete 时 GUI 先 bridge.deliver_result 再 monitor.acknowledge_result；compact 在 ack 的 worker 内执行，绝不阻挡已完成的回传）
+
+compact_success_behavior:
+compact_success 事件一次 + UI 日志“自动任务会话压缩完成”（不改最近结果/当前任务文案、不弹 modal）
+
+compact_failure_behavior:
+compact_failed 事件一次 + UI 日志“自动压缩失败：<error>”；仍 finish_auto_task（compact 失败 != 任务失败，不把“结果已进入回传链路”改成失败）
+
+compact_failure_blocks_next_task:
+No（flags reset，下一 RemoteTask 可正常接收）
+
+wrong_ack_behavior:
+event_id != _active_event_id → 不 compact / 不 finish / 不 reset（active 任务保留，防迟到/错 ack 压错、清错任务）
+
+compact_success_event:
+{type, event_id}
+
+compact_failed_event:
+{type, event_id, error}
+
+checkbox_wiring:
+on_auto_compact(enabled) → monitor.set_auto_compact(enabled) + 日志（开→“自动压缩已开启”/关→“自动压缩已关闭”）；monitor=None 不崩
+
+manual_compact_unchanged:
+True（[立即压缩当前会话] 仍走 controller.compact_current_session 针对 UI active session，语义不回归；与自动任务冻结 session compact 明确区分、不混用）
+
+worker_thread_http:
+True（client.compact_session summarize HTTP 全在 monitor worker 线程）
+
+gui_thread_compact_http:
+False（GUI 只做 set_auto_compact/acknowledge_result 入队 + UI 日志，不执行任何 OpenChamber HTTP）
+
+tests:
+293 passed（全量；L05-05 基线 267 → 293，净增 26：test_controller 7 + test_auto_monitor 11 + test_ui_wiring 9，另更新 test_ack_wrong_event_keeps_task / test_auto_compact_does_not_call_compact 以匹配新语义）
+
+compile:
+OK（py_compile controller.py auto_monitor.py main.py）
+
+diff_check:
+OK（git diff --check 无 whitespace 错误，仅 LF→CRLF 换行提示）
+
+worktree:
+6 文件 modified（controller.py auto_monitor.py main.py + 3 测试）+ AI_RELAY_MESSAGE.txt untracked（忽略、不 add、不 commit）
+
+real_prompt_post:
+0
+real_resume_post:
+0
+real_compact:
+0
+real_clipboard_write:
+0
+（全 fake/offscreen：FakeClient/FakeController/FakeMonitor/FakeBridge；未起真实 OpenChamber 自动任务、未触真实 summarize/剪贴板）
+
+changed_files:
+controller.py
+auto_monitor.py
+main.py
+tests/test_controller.py
+tests/test_auto_monitor.py
+tests/test_ui_wiring.py
+（未改 openchamber_client.py / ui/main_window.py / cliplink_bridge.py / cliplink_status.py / active_session_reader.py / ClipLink repo；compact_session(session_id, directory) 底层已存在，未重写 summarize API）
+
+commit:
+664193f74ea262d8e0be58fa5dc50134f645718d
+push:
+origin lite（6ffe5e2..664193f）
+local_head:
+664193f74ea262d8e0be58fa5dc50134f645718d
+remote_head:
+664193f74ea262d8e0be58fa5dc50134f645718d
+
+blockers:
+无
+
+L05_06=PASS
+READY_FOR_REAL_E2E=YES
+
+已完成内容：
+L05-06 完成自动压缩。Controller 新增 compact_auto_task(event_id)：无任务/event_id 不匹配/未冻结 session 均返回失败且不调用 compact_session，合法则直接用 AutoTask 冻结的 session_id+directory 调 client.compact_session（绝不读 UI 当前激活会话），且不 clear AutoTask、不变 state、不改 message_id/resume 历史（释放仍由 finish_auto_task 单独负责）。AutoMonitor 新增运行时开关 _auto_compact_enabled（默认 OFF）+ set_auto_compact(enabled) GUI 入口（只入队、worker 更新）；_handle_ack 改为“验证 event_id==_active_event_id →（开关开）compact_auto_task → 发 compact_success/failed 事件 → finish_auto_task → reset flags”，结果先交 Bridge 后才 compact、compact 失败仍 finish、stale/wrong ack 全不触发。main.py on_auto_compact 接 monitor.set_auto_compact + 开/关日志（monitor=None 不崩），_dispatch 新增 compact_success/compact_failed 日志分支（不改最近结果/当前任务文案、不弹 modal）；手动“立即压缩当前会话”仍走 compact_current_session 不回归。全 293 测试通过、全 fake、0 真实 prompt/resume/compact/clipboard。
+
+下一步内容：
+代码功能层面封板，进入真实双端 E2E 验收（A→ClipLink→B→OpenChamber→结果→ClipLink→A）；单独验证：一次断网恢复、一次 A 离线结果 pending、一次 AI_RELAY_COMPLETE 停止。
+
+整体预计完成率：
+Lite 约 98%（功能封板，待真实 E2E 验收）
+
+[AI_RELAY_TASK_ID: c29eb17a-f864-4b1e-8382-746de7d15be3]

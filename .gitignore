@@ -14,3 +14,7 @@ __pycache__/
 *.pyc
 *.log
 config.json
+# 构建产物（可再生，不入库）
+build_portable/
+dist_portable/
+dist_release_retry/

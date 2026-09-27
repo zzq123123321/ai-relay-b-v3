@@ -23,8 +23,8 @@ OpenChamber；任何异常一律返回 None）。"最近激活会话"有两种�
   新格式的 `seen` 仅在 UI 有交互时刷新（空闲期冻结），故本模块不按墙钟
   时间窗过滤，直接取 seen 最大条目（= UI 自身"最近查看"语义）。
   调用方应再用 openchamber_client.validate_session 对服务端核实会话仍存在。
-- 本读取依赖 LevelDB 数据块未压缩（本机 OpenChamber 实测 comp=none，
-  值紧跟 key 之后为明文字节）。若未来 Chromium 改为压缩 SST，需补解压。
+- 本读取只读 LevelDB WAL/SST 记录，支持未压缩和 Snappy 数据块，不以原始
+  字节搜索结果冒充键值（元数据索引也可能包含相同的键名）。
 """
 
 from __future__ import annotations
@@ -144,6 +144,182 @@ def _value_from_file(data: bytes, key: str) -> object:
     value = _extract_json_after(data, _key_value_start(data, anchor, key_anchor, key_plain))
     return value if value is not None else _DELETED
 
+def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError("truncated varint")
+        part = data[offset]
+        offset += 1
+        value |= (part & 0x7f) << shift
+        if not part & 0x80:
+            return value, offset
+    raise ValueError("invalid varint")
+
+def _snappy_decode(data: bytes) -> bytes:
+    expected, offset = _read_varint(data, 0)
+    if expected > 16 * 1024 * 1024:
+        raise ValueError("oversized block")
+    output = bytearray()
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        kind = tag & 3
+        if kind == 0:
+            count = tag >> 2
+            if count >= 60:
+                width = count - 59
+                if offset + width > len(data):
+                    raise ValueError("truncated literal length")
+                count = int.from_bytes(data[offset:offset + width], "little")
+                offset += width
+            count += 1
+            if offset + count > len(data) or len(output) + count > expected:
+                raise ValueError("truncated literal")
+            output.extend(data[offset:offset + count])
+            offset += count
+        else:
+            if kind == 1:
+                count = ((tag >> 2) & 7) + 4
+                width = 1
+            else:
+                count = (tag >> 2) + 1
+                width = 2 if kind == 2 else 4
+            if offset + width > len(data):
+                raise ValueError("truncated copy")
+            distance = int.from_bytes(data[offset:offset + width], "little")
+            if kind == 1:
+                distance |= (tag & 0xe0) << 3
+            offset += width
+            if not distance or distance > len(output) or len(output) + count > expected:
+                raise ValueError("invalid copy")
+            for _ in range(count):
+                output.append(output[-distance])
+    if len(output) != expected:
+        raise ValueError("invalid block size")
+    return bytes(output)
+
+def _table_block(data: bytes, offset: int, length: int) -> bytes:
+    if offset + length + 5 > len(data):
+        raise ValueError("truncated table block")
+    body = data[offset:offset + length]
+    compression = data[offset + length]
+    if compression == 0:
+        return body
+    if compression == 1:
+        return _snappy_decode(body)
+    raise ValueError("unsupported table compression")
+
+def _block_entries(data: bytes):
+    if len(data) < 4:
+        raise ValueError("short table block")
+    restarts = int.from_bytes(data[-4:], "little")
+    end = len(data) - 4 - 4 * restarts
+    if end < 0:
+        raise ValueError("invalid restart array")
+    offset = 0
+    previous_key = b""
+    while offset < end:
+        shared, offset = _read_varint(data, offset)
+        suffix_length, offset = _read_varint(data, offset)
+        value_length, offset = _read_varint(data, offset)
+        if shared > len(previous_key) or offset + suffix_length + value_length > end:
+            raise ValueError("invalid table entry")
+        key = previous_key[:shared] + data[offset:offset + suffix_length]
+        offset += suffix_length
+        value = data[offset:offset + value_length]
+        offset += value_length
+        previous_key = key
+        yield key, value
+
+def _local_storage_value(value: bytes) -> bytes:
+    if value.startswith(b"\x01"):
+        return value[1:]
+    if value.startswith(b"\x00"):
+        return value[1:].decode("utf-16-le").encode("utf-8")
+    return value
+
+def _table_records(data: bytes, target: bytes):
+    if len(data) < 48 or data[-8:] != bytes.fromhex("57fb808b247547db"):
+        return
+    footer = len(data) - 48
+    _, offset = _read_varint(data, footer)
+    _, offset = _read_varint(data, offset)
+    index_offset, offset = _read_varint(data, offset)
+    index_length, _ = _read_varint(data, offset)
+    index = _table_block(data, index_offset, index_length)
+    for _, handle in _block_entries(index):
+        block_offset, offset = _read_varint(handle, 0)
+        block_length, _ = _read_varint(handle, offset)
+        for internal_key, value in _block_entries(_table_block(data, block_offset, block_length)):
+            if len(internal_key) < 8 or not internal_key[:-8].endswith(target):
+                continue
+            sequence_and_type = int.from_bytes(internal_key[-8:], "little")
+            if sequence_and_type & 0xff == 0:
+                yield sequence_and_type >> 8, _DELETED
+            elif sequence_and_type & 0xff == 1:
+                yield sequence_and_type >> 8, _local_storage_value(value)
+
+def _log_records(data: bytes, target: bytes):
+    offset = 0
+    fragments = bytearray()
+    while offset + 7 <= len(data):
+        block_remaining = 32768 - offset % 32768
+        if block_remaining < 7:
+            offset += block_remaining
+            continue
+        length = int.from_bytes(data[offset + 4:offset + 6], "little")
+        kind = data[offset + 6]
+        offset += 7
+        if not kind or offset + length > len(data) or length > block_remaining - 7:
+            offset += block_remaining - 7
+            fragments.clear()
+            continue
+        fragment = data[offset:offset + length]
+        offset += length
+        if kind in (1, 2):
+            fragments.clear()
+        fragments.extend(fragment)
+        if kind not in (1, 4):
+            continue
+        batch = bytes(fragments)
+        fragments.clear()
+        if len(batch) < 12:
+            continue
+        sequence = int.from_bytes(batch[:8], "little")
+        count = int.from_bytes(batch[8:12], "little")
+        position = 12
+        for index in range(count):
+            if position >= len(batch):
+                break
+            entry_type = batch[position]
+            position += 1
+            key_length, position = _read_varint(batch, position)
+            key = batch[position:position + key_length]
+            position += key_length
+            if entry_type == 1:
+                value_length, position = _read_varint(batch, position)
+                value = batch[position:position + value_length]
+                position += value_length
+            else:
+                value = b""
+            if key.endswith(target):
+                yield sequence + index, _local_storage_value(value) if entry_type == 1 else _DELETED
+
+def _read_leveldb_records(base: Path, key: str) -> bytes | None:
+    target = b"\x00\x01" + key.encode("utf-8")
+    latest = (-1, None)
+    for path in list(base.glob("*.log")) + list(base.glob("*.ldb")):
+        try:
+            data = path.read_bytes()
+            records = _log_records(data, target) if path.suffix == ".log" else _table_records(data, target)
+            for record in records:
+                if record[0] > latest[0]:
+                    latest = record
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+    return latest[1] if isinstance(latest[1], bytes) else None
+
 
 def read_leveldb_value(leveldb_dir: str | os.PathLike, key: str = LAST_SESSION_KEY) -> bytes | None:
     """只读扫描一个 LevelDB 目录，返回 key 的最新值（或 None）。
@@ -154,6 +330,8 @@ def read_leveldb_value(leveldb_dir: str | os.PathLike, key: str = LAST_SESSION_K
     base = Path(leveldb_dir)
     if not base.is_dir():
         return None
+    if (base / "CURRENT").is_file():
+        return _read_leveldb_records(base, key)
     logs = [p for p in base.glob("*.log") if p.is_file()]
     ldbs = [p for p in base.glob("*.ldb") if p.is_file()]
     for path in sorted(logs, reverse=True) + sorted(ldbs, reverse=True):

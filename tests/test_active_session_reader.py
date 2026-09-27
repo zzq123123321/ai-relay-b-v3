@@ -20,6 +20,7 @@ import pytest
 
 from active_session_reader import (
     ActiveSession,
+    _snappy_decode,
     parse_last_session_value,
     parse_session_activity_value,
     read_active_session,
@@ -48,6 +49,68 @@ def _write_dir(tmp_path, files: dict[str, bytes]):
     for name, data in files.items():
         (tmp_path / name).write_bytes(data)
     return tmp_path
+
+def _varint(value: int) -> bytes:
+    result = bytearray()
+    while value >= 128:
+        result.append((value & 127) | 128)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+def _table_block(entries: list[tuple[bytes, bytes]]) -> bytes:
+    result = bytearray()
+    for key, value in entries:
+        result.extend(b"\x00" + _varint(len(key)) + _varint(len(value)) + key + value)
+    result.extend((0).to_bytes(4, "little") + (1).to_bytes(4, "little"))
+    return bytes(result)
+
+def _snappy_literal(data: bytes) -> bytes:
+    length = len(data) - 1
+    if length < 60:
+        tag = bytes([length << 2])
+    else:
+        width = max(1, (length.bit_length() + 7) // 8)
+        tag = bytes([(59 + width) << 2]) + length.to_bytes(width, "little")
+    return _varint(len(data)) + tag + data
+
+def _sst(key: str, value: bytes, sequence: int = 5) -> bytes:
+    internal_key = b"_openchamber-ui://app\x00\x01" + key.encode() + ((sequence << 8) | 1).to_bytes(8, "little")
+    data = _table_block([(internal_key, b"\x01" + value)])
+    data_block = _snappy_literal(data) + b"\x01" + bytes(4)
+    index_value = _varint(0) + _varint(len(data_block) - 5)
+    index = _table_block([(b"index", index_value)])
+    index_offset = len(data_block)
+    index_block = index + b"\x00" + bytes(4)
+    footer = b"\x00\x00" + _varint(index_offset) + _varint(len(index))
+    return data_block + index_block + footer.ljust(40, b"\x00") + bytes.fromhex("57fb808b247547db")
+
+def _wal(key: str, value: bytes, sequence: int = 6, deleted: bool = False) -> bytes:
+    stored_key = b"_openchamber-ui://app\x00\x01" + key.encode()
+    entry = bytes([0 if deleted else 1]) + _varint(len(stored_key)) + stored_key
+    if not deleted:
+        stored_value = b"\x01" + value
+        entry += _varint(len(stored_value)) + stored_value
+    batch = sequence.to_bytes(8, "little") + (1).to_bytes(4, "little") + entry
+    return bytes(4) + len(batch).to_bytes(2, "little") + b"\x01" + batch
+
+def test_snappy_short_copy_decodes_repeated_bytes():
+    assert _snappy_decode(b"\x0a\x08abc\x0d\x03") == b"abcabcabca"
+
+def test_real_leveldb_sst_reads_active_session_not_metadata(tmp_path):
+    value = _value_bytes("ses_current", "D:/current")[len(_KEY):]
+    _write_dir(tmp_path, {"CURRENT": b"MANIFEST-000001\n", "000001.ldb": _sst("oc.lastSession.v1", value)})
+    result = read_active_session(tmp_path)
+    assert result == ActiveSession("ses_current", "D:/current", "persisted-last-active")
+
+def test_real_leveldb_wal_updates_and_deletes_session(tmp_path):
+    older = _value_bytes("ses_old")[len(_KEY):]
+    newer = _value_bytes("ses_new")[len(_KEY):]
+    _write_dir(tmp_path, {"CURRENT": b"MANIFEST-000001\n", "000001.ldb": _sst("oc.lastSession.v1", older),
+                          "000002.log": _wal("oc.lastSession.v1", newer)})
+    assert read_active_session(tmp_path).session_id == "ses_new"
+    (tmp_path / "000002.log").write_bytes(_wal("oc.lastSession.v1", b"", deleted=True))
+    assert read_active_session(tmp_path) is None
 
 
 # --- 读取：有效值 -------------------------------------------------------

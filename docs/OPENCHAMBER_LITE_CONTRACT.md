@@ -14,7 +14,7 @@
 | B | 当前激活会话 | **无服务端接口**（事实，见下节） | — | — | — | — | "获取当前激活会话"按钮 | 见下节 |
 | C | 当前 session 消息读取 | GET | `/api/session/{session_id}/message` | `directory=<urlencoded 绝对路径>`（必填，值取自会话自身 `directory` 字段） | loopback Bearer | JSON list：`[{info:{id, sessionID, role, time, agent, model, parentID...}, parts:[{type:"text", text}]}]`（本轮实测 200；schema 与 v3 T21 一致） | 读结果 / watchdog 进展检测 | **是**（200） |
 | D | 向指定 session 发 prompt | POST | `/api/session/{session_id}/prompt_async` | `directory=<urlencoded>` | loopback Bearer | 204 = accepted（**≠completed**）；body（v3 T21 真实发送形状）：`{messageID, model:{providerID, modelID}, agent, variant, parts:[{type:"text", text}]}` | A端任务 / 手动发送 / resume_prompt | 否（本轮禁止真实 POST；引用 v3 T21 SUPPORTED_REAL） |
-| E | compact 当前 session | POST | `/api/session/{session_id}/summarize` | `directory=<urlencoded>`（**可选**；不带时上游按客户端 `x-opencode-directory` 头或 opencode 进程 cwd 解析） | loopback Bearer | 200 + JSON `true`；body：`{providerID, modelID}`（UI 实际发送形状） | "立即压缩当前会话" / 自动压缩 | 否（本轮禁止 POST；源码合同，见下） |
+| E | compact 当前 session | POST | 新版 `/api/session/{session_id}/compact`；404 时旧版 `/api/session/{session_id}/summarize` | `directory=<urlencoded>` 可选；新版 body `{}`，旧版 body `{providerID, modelID}` | loopback Bearer | 新版 2xx + 非空成功 JSON；旧版 200 + JSON `true` | "立即压缩当前会话" / 自动压缩 | 否（未对真实会话执行 POST；版本合同见下） |
 
 ## B. "当前激活会话"事实结论（重点）
 
@@ -71,13 +71,15 @@ A 端裁决走**候选 2**：读 OpenChamber 自己落盘的 `oc.lastSession.v1`
 
 **L02-02 只读实测**：真实 GET 12 次（health + session 列表 + 会话消息 + 单会话对象，全部只读）；`real_prompt_post=0 / real_compact=0 / real_create=0`。
 
-## E. compact 源码证据
+## E. compact 源码证据与版本兼容
+
+2026-09-26 本机只读核对：OpenChamber 2.0.1、内置 OpenCode 2.0.16。新版 UI 调用 `session.compact({sessionID})`，其 SDK 路由为 `POST /api/session/{sessionID}/compact`，body `{}`（省略可选 `id`/`delivery`）。原先 `/summarize` 在该版本返回 404。Lite 现优先调用 `/compact`，仅当该端点返回 404 时才回退旧版 `/summarize`；不向真实会话发送测试 POST。
 
 - UI 的"压缩会话" = composer 斜杠命令 `/compact`（`packages/ui/src/components/chat/CommandAutocomplete.tsx:156`）→ `opencodeClient.summarizeSession(...)`（`packages/ui/src/lib/opencode/client.ts:1123-1132`）→ SDK `session.summarize` → **`POST /session/{sessionID}/summarize`**（SDK `@opencode-ai/sdk@1.18.29` 映射，query `directory`/`workspace` 可选，body `{providerID, modelID, auto?}`）。
 - OpenChamber server 无自有 compact 路由，`/api/*` 全部 proxy 到 OpenCode 上游（`pathRewrite: {'^/api': ''}`，`lib/opencode/proxy.js:877-887`），并先做 directory query 规范化（`proxy.js:938-948`）。
-- SDK 另有一个新方法 `session.compact` → `POST /api/session/{sessionID}/compact`（无 query/body，新版 opencode httpapi），但 OpenChamber UI/server **均未使用**。Lite 第一版跟随 UI 走 `/summarize`。
+- 下列证据针对 OpenChamber 1.24.2 + 旧版 OpenCode；新版 UI 已改用 `session.compact`，不能继续以此判断当前版本的路由。
 - 成功判定：HTTP 200 且 body `true`；压缩完成后 OpenCode 发 `session.compacted` SSE 事件（`{type:"session.compacted", properties:{sessionID}}`）。
-- v3 时代"裸 `/compact` 走 send 端点 vs 程序化 compact 路径"的 G4 冲突已被源码解答：UI 走的就是程序化 `summarize`；Lite 采用同路径即可，无需再复核。
+- 直接把 `/compact` 文本送进普通消息路由仍不等于原生压缩；请使用对应版本的专用 API。
 
 ## 认证边界（沿用 v3 合同 §4）
 

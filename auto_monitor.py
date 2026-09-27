@@ -17,7 +17,7 @@ import threading
 
 # watchdog action → 事件 type（none 不发事件）
 _WORKDOG_EVENTS = frozenset(
-    {"sent", "offline", "recover_check", "resumed_automatically", "resume_sent"}
+    {"sent", "submit_confirmed", "offline", "recover_check", "resumed_automatically", "resume_sent"}
 )
 
 
@@ -26,7 +26,7 @@ class AutoMonitor:
 
     controller 由外部注入（依赖 LiteController 的 receive_auto_task / watchdog_tick /
     inspect_auto_task_result / begin_interrupted_recovery / compact_auto_task /
-    finish_auto_task 六个方法）。
+    finish_auto_task / identity_snapshot 七个方法）。
     monitor 自己不访问 ClipLink 状态、不写剪贴板、不操作 Qt、不调 bridge.deliver_result。
     """
 
@@ -43,15 +43,22 @@ class AutoMonitor:
         self._first_response_sent = False
         self._result_complete_sent = False
         self._result_ambiguous_sent = False
+        self._result_interrupted_sent = False
         self._paused = False
         # 自动压缩运行时开关：仅 worker 线程读写，默认 OFF，不持久化。
         # GUI 经 set_auto_compact 入队更新；用 ack 处理时的最新值，不冻结到任务创建时。
         self._auto_compact_enabled = False
 
     # ---------------- GUI 线程调用（线程安全：只入队，不做 HTTP）----------------
-    def submit_remote_task(self, event_id: str, text: str, wrapper_template: str) -> None:
-        """把 A端 RemoteTask 交给后台 worker 包装并首发送（主线程 0 HTTP）。"""
-        self._cmd.put(("submit", event_id, text, wrapper_template))
+    def submit_remote_task(self, event_id: str, text: str, wrapper_template: str,
+                       attempt: int | None = None) -> None:
+        """把 A端 RemoteTask 交给后台 worker 包装并首发送（主线程 0 HTTP）。
+
+        attempt 是 Bridge 内部投递轮次令牌（阶段 3F-2）：worker 的 accepted/busy
+        回执原样带回，GUI 据此匹配对应投递轮，防跨 busy 重试的旧回执误配；
+        既有无令牌直接调用传 None，按 event_id 匹配，行为兼容。
+        """
+        self._cmd.put(("submit", event_id, text, wrapper_template, attempt))
 
     def set_auto_compact(self, enabled: bool) -> None:
         """GUI 线程调用：只把开关更新入队，不做任何 OpenChamber HTTP；worker 收到后生效。"""
@@ -111,24 +118,42 @@ class AutoMonitor:
             except queue.Empty:
                 return
             if cmd[0] == "submit":
-                self._handle_submit(cmd[1], cmd[2], cmd[3])
+                self._handle_submit(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
             elif cmd[0] == "ack":
                 self._handle_ack(cmd[1])
             elif cmd[0] == "set_auto_compact":
                 self._auto_compact_enabled = bool(cmd[1])
 
-    def _handle_submit(self, event_id: str, text: str, template: str) -> None:
+    def _handle_submit(self, event_id: str, text: str, template: str,
+                   attempt: int | None = None) -> None:
+        """worker：包装+首发送；busy 不替换当前任务、0 次模型 HTTP（busy 判定在 try_send 之前）。
+
+        回执事件携带 event_id + attempt（阶段 3F-2）：GUI 匹配 Bridge 在途单槽后
+        accepted 释放/记 consumed，busy 回队首（不标 consumed、不丢正文）。
+        """
         intake = self._controller.receive_auto_task(event_id, text, template)
         if not intake.accepted:
-            self._emit({"type": "intake_busy"})
+            self._emit({"type": "intake_busy", "event_id": event_id, "attempt": attempt})
             return
         self._active_event_id = event_id
         self._first_response_ms = None
         self._first_response_sent = False
         self._result_complete_sent = False
         self._result_ambiguous_sent = False
+        self._result_interrupted_sent = False
         self._paused = False
-        self._emit({"type": "intake_running" if intake.submitted else "intake_ready"})
+        if intake.superseded_event_id is not None:
+            self._emit({"type": "previous_turn_superseded", "event_id": intake.superseded_event_id})
+        self._emit(
+            {
+                "type": (
+                    "intake_running" if intake.submitted else
+                    "intake_unknown" if getattr(self._controller, "auto_task_submit_unknown", lambda: False)() else "intake_ready"
+                ),
+                "event_id": event_id,
+                "attempt": attempt,
+            }
+        )
 
     def _handle_ack(self, event_id: str) -> None:
         """GUI 已把结果交给 Bridge 后释放任务：结果先回传，compact 才执行（绝不阻挡回传）。
@@ -156,6 +181,7 @@ class AutoMonitor:
         self._first_response_sent = False
         self._result_complete_sent = False
         self._result_ambiguous_sent = False
+        self._result_interrupted_sent = False
         self._paused = False
 
     def _handle_result(self) -> None:
@@ -183,6 +209,9 @@ class AutoMonitor:
                         "event_id": self._active_event_id,
                         "text": result.text,
                         "first_response_ms": self._first_response_ms,
+                        # 冻结身份快照（不可变值，与 event_id 一致）；身份无效时
+                        # 原始结果仍交给 GUI 展示，但 GUI 不得据此 deliver/ack
+                        "identity": self._controller.identity_snapshot(self._active_event_id),
                     }
                 )
             return
@@ -194,6 +223,12 @@ class AutoMonitor:
                 self._emit({"type": "result_ambiguous", "event_id": self._active_event_id})
             return
         if result.interrupted:
+            if getattr(self._controller, "auto_task_is_local", lambda: None)() is False:
+                if not self._result_interrupted_sent:
+                    self._result_interrupted_sent = True
+                    self._paused = True
+                    self._emit({"type": "result_interrupted", "event_id": self._active_event_id})
+                return
             # 服务在线但本次执行已中断 → 复用 watchdog 恢复流程（observe 5s → resume 一次）
             self._controller.begin_interrupted_recovery()
 

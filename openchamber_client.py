@@ -9,7 +9,7 @@
     ② 会话对象自身的 agent/model；
     都没有 → None（unavailable）。绝不猜默认模型。
   - send_text()：把 text 原样通过 prompt_async 发送（204=accepted，≠完成）。
-  - compact_session()：走 UI 同路径 POST /summarize 压缩当前会话。
+  - compact_session()：优先走新版 UI 的 POST /compact；旧版回退 /summarize。
 
 延迟口径：服务延迟 != 模型首响应延迟。模型首响应由真实任务
 （prompt 发出 → 第一段模型响应）另行计算。
@@ -92,6 +92,11 @@ class ExecutionConfig:
     variant: str | None
     source: str
 
+@dataclass(frozen=True, slots=True)
+class ModelTarget:
+    local: bool
+    base_url: str | None
+
 
 @dataclass(frozen=True, slots=True)
 class SendResult:
@@ -100,6 +105,8 @@ class SendResult:
     accepted: bool
     error: str | None
     message_id: str | None
+    baseline_user_id: str | None = None
+    can_reconcile: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +174,7 @@ class OpenChamberClient:
         self.timeout = timeout
         env_token = os.environ.get("OPENCHAMBER_CLIENT_TOKEN", "").strip()
         self._token = (token or env_token) or resolve_local_token(base, settings_path=settings_path)
+        self._modern_api = False
 
     def probe(self) -> ProbeResult:
         url = self.base_url + "/health"
@@ -234,6 +242,164 @@ class OpenChamberClient:
         except OSError as exc:
             return None, b"", f"connection: {exc}"
 
+    def _modern_control(self, action: str, input_data: dict) -> tuple[dict | None, str | None]:
+        url = self.base_url + "/api/openchamber/control"
+        body = json.dumps({"action": action, "input": input_data}, ensure_ascii=False).encode("utf-8")
+        status, raw, error = self._http(url, data=body)
+        if status is None or not 200 <= status < 300:
+            return None, error or f"http: {status}"
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None, "malformed: control response"
+        return (result, None) if isinstance(result, dict) else (None, "malformed: control response")
+
+    def _modern_send(
+        self, session_id: str, directory: str | None, text: str, config: ExecutionConfig
+    ) -> SendResult:
+        context = {"sessionId": session_id, "directory": directory}
+        state, error = self._modern_control("session.status", context)
+        if error or not isinstance(state.get("sessionStatus") if isinstance(state, dict) else None, dict):
+            return SendResult(False, error or "malformed: session status", None)
+        if state["sessionStatus"].get("type") not in ("idle", "busy", "retry"):
+            return SendResult(False, "unavailable: 无法确认当前会话空闲", None)
+        if state["sessionStatus"].get("type") != "idle":
+            return SendResult(False, "busy: 当前会话尚未空闲", None)
+        baseline, error = self._modern_control("session.messages", {**context, "role": "user", "last": True})
+        if error or not isinstance(baseline.get("messages") if isinstance(baseline, dict) else None, list):
+            return SendResult(False, error or "malformed: baseline messages", None)
+        if baseline["messages"] and not isinstance(baseline["messages"][0], dict):
+            return SendResult(False, "malformed: baseline message", None)
+        previous_id = baseline["messages"][0].get("id") if baseline["messages"] else None
+        if baseline["messages"] and (not isinstance(previous_id, str) or not previous_id):
+            return SendResult(False, "malformed: baseline message identity", None)
+        dispatched, error = self._modern_control(
+            "session.send",
+            {**context, "prompt": text, "model": config.provider_id + "/" + config.model_id,
+             "agent": config.agent},
+        )
+        if not error and dispatched.get("promptDispatched") is not True:
+            return SendResult(False, dispatched.get("promptError") or "提交未被接受", None)
+        expected_text = text.strip().replace("\r\n", "\n")
+        for attempt in range(6):
+            if attempt:
+                time.sleep(0.5)
+            landed, read_error = self._modern_control(
+                "session.messages", {**context, "role": "user", "last": True}
+            )
+            messages = landed.get("messages") if isinstance(landed, dict) else None
+            if read_error or not isinstance(messages, list) or not messages:
+                continue
+            message = messages[0]
+            if not isinstance(message, dict):
+                return SendResult(False, "uncertain: 已提交但消息身份不匹配", None, previous_id, True)
+            if message.get("id") == previous_id:
+                continue
+            landed_text = message.get("text")
+            if (message.get("id") and isinstance(landed_text, str)
+                    and landed_text.strip().replace("\r\n", "\n") == expected_text):
+                return SendResult(True, None, message["id"])
+            return SendResult(False, "uncertain: 已提交但消息身份不匹配", None, previous_id, True)
+        return SendResult(
+            False, "uncertain: 已提交但未确认消息身份" + ("：" + error if error else ""),
+            None, previous_id, True,
+        )
+
+    def confirm_uncertain_submission(
+        self, session_id: str, directory: str | None, text: str, baseline_user_id: str | None
+    ) -> str | None:
+        result, error = self._modern_messages(session_id, directory)
+        if error:
+            return None
+        messages = result["messages"]
+        users = [message for message in messages if message.get("role") == "user"]
+        if baseline_user_id is not None:
+            baseline_index = next(
+                (index for index, message in enumerate(users) if message.get("id") == baseline_user_id),
+                None,
+            )
+            if baseline_index is None:
+                return None
+            users = users[baseline_index + 1:]
+        if len(users) != 1:
+            return None
+        candidate = users[0]
+        candidate_text = candidate.get("text")
+        if (candidate.get("id") and isinstance(candidate_text, str)
+                and candidate_text.strip().replace("\r\n", "\n") == text.strip().replace("\r\n", "\n")):
+            return candidate["id"]
+        return None
+
+    def _modern_messages(self, session_id: str, directory: str | None) -> tuple[dict | None, str | None]:
+        result, error = self._modern_control(
+            "session.messages", {"sessionId": session_id, "directory": directory, "all": True}
+        )
+        if error or not isinstance(result.get("messages") if isinstance(result, dict) else None, list) or not isinstance(result.get("sessionStatus"), dict):
+            return None, error or "malformed: session messages"
+        if any(not isinstance(message, dict) for message in result["messages"]):
+            return None, "malformed: session messages"
+        return result, None
+
+    def _modern_progress(
+        self, session_id: str, directory: str | None, user_message_id: str
+    ) -> TaskProgressResult:
+        result, error = self._modern_messages(session_id, directory)
+        if error:
+            return TaskProgressResult(False, None, False, error)
+        messages = result["messages"]
+        anchor = next((index for index, msg in enumerate(messages) if msg.get("id") == user_message_id), None)
+        tail = messages[anchor:] if anchor is not None else messages
+        marker = hashlib.sha256(json.dumps(tail, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        return TaskProgressResult(True, marker, anchor is not None, None)
+
+    def _modern_result(
+        self, session_id: str, directory: str | None, user_message_id: str,
+        allowed_followup_user_ids=None,
+    ) -> TaskResultResult:
+        result, error = self._modern_messages(session_id, directory)
+        if error:
+            return TaskResultResult(False, False, None, None, False, False, error)
+        messages = result["messages"]
+        anchor = next((index for index, msg in enumerate(messages) if msg.get("id") == user_message_id), None)
+        if anchor is None:
+            return TaskResultResult(False, False, None, None, False, False, "not_found: user_message_id 未找到")
+        tail = messages[anchor + 1:]
+        allowed = {user_message_id, *(allowed_followup_user_ids or ())}
+        ambiguous = any(msg.get("role") == "user" and msg.get("id") not in allowed for msg in tail)
+        assistants = [msg for msg in tail if msg.get("role") == "assistant"]
+        created = messages[anchor].get("createdAt")
+        first_response_ms = None
+        if assistants and isinstance(created, (int, float)):
+            seen = assistants[0].get("createdAt")
+            if isinstance(seen, (int, float)):
+                first_response_ms = max(0, int(seen - created))
+        if result["sessionStatus"].get("type") != "idle" or not assistants or ambiguous:
+            return TaskResultResult(True, False, None, first_response_ms, ambiguous, False, None)
+        latest = assistants[-1]
+        if not latest.get("completedAt") or not isinstance(latest.get("text"), str) or not latest["text"].strip():
+            return TaskResultResult(True, False, None, first_response_ms, False, False, None)
+        url = f"{self.base_url}/api/session/{urllib.parse.quote(session_id, safe='')}/message/{urllib.parse.quote(latest['id'], safe='')}"
+        if directory:
+            url += "?directory=" + urllib.parse.quote(directory, safe="/")
+        status, raw, detail_error = self._http(url)
+        if status is None or not 200 <= status < 300:
+            return TaskResultResult(False, False, None, first_response_ms, False, False, detail_error or f"http: {status}")
+        try:
+            detail = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return TaskResultResult(False, False, None, first_response_ms, False, False, "malformed: assistant detail")
+        info = detail.get("data", detail) if isinstance(detail, dict) else None
+        if not isinstance(info, dict):
+            return TaskResultResult(False, False, None, first_response_ms, False, False, "malformed: assistant detail")
+        if info.get("error"):
+            return TaskResultResult(True, False, None, first_response_ms, False, True, None)
+        finish = info.get("finish")
+        if not finish or finish in ("tool-calls", "unknown"):
+            return TaskResultResult(True, False, None, first_response_ms, False, False, None)
+        if finish in ("error", "length", "content-filter"):
+            return TaskResultResult(True, False, None, first_response_ms, False, True, None)
+        return TaskResultResult(True, True, latest["text"], first_response_ms, False, False, None)
+
     def validate_session(self, session_id: str, directory: str | None = None) -> bool:
         """只读核实：会话是否存在、directory 是否可用。
 
@@ -245,6 +411,74 @@ class OpenChamberClient:
             return False
         status, _body, _error = self._http(self._messages_url(session_id, directory))
         return status is not None and status < 400
+
+    def resolve_session_directory(self, session_id: str) -> str | None:
+        """从已核实会话对象读取新版 API 所需目录，不猜测工作目录。"""
+        if not session_id:
+            return None
+        url = f"{self.base_url}/api/session/{urllib.parse.quote(session_id, safe='')}"
+        status, raw, _error = self._http(url)
+        if status is None or not 200 <= status < 300:
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        session = data.get("data", data) if isinstance(data, dict) else None
+        if not isinstance(session, dict) or session.get("id") != session_id:
+            return None
+        location = session.get("location")
+        directory = location.get("directory") if isinstance(location, dict) else None
+        return directory if isinstance(directory, str) and directory.strip() else None
+
+    def selected_model_target(
+        self, session_id: str, directory: str | None, local_base_url: str,
+        config: ExecutionConfig | None = None,
+    ) -> ModelTarget | None:
+        """仅当当前 provider 的地址匹配用户保存的监测地址时判为本地。"""
+        config = config or self.resolve_execution_config(session_id, directory)
+        if config is None:
+            return None
+        url = self.base_url + "/api/provider"
+        if directory:
+            url += "?directory=" + urllib.parse.quote(directory, safe="/")
+        status, raw, _error = self._http(url)
+        if status is None or not 200 <= status < 300:
+            return None
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        providers = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(providers, list):
+            return None
+        provider = next(
+            (item for item in providers if isinstance(item, dict) and item.get("id") == config.provider_id), None
+        )
+        if provider is None:
+            return None
+        settings = provider.get("settings")
+        base_url = settings.get("baseURL") if isinstance(settings, dict) else None
+        if not isinstance(base_url, str) or not base_url.strip():
+            return ModelTarget(False, None)
+        def address_key(url: str):
+            try:
+                parsed = urllib.parse.urlsplit(url.strip())
+                if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                        or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                    return None
+                return (parsed.scheme, parsed.hostname.lower(), parsed.port,
+                        parsed.path.rstrip("/"))
+            except ValueError:
+                return None
+
+        provider_key = address_key(base_url)
+        local_key = address_key(local_base_url)
+        if provider_key is None or local_key is None:
+            return None
+        if provider_key == local_key:
+            return ModelTarget(True, local_base_url.rstrip("/"))
+        return ModelTarget(False, base_url.rstrip("/"))
 
     def _messages_url(self, session_id: str, directory: str | None) -> str:
         url = (
@@ -267,6 +501,8 @@ class OpenChamberClient:
         providerID、modelID 均非空；variant 可空）。
         回退：会话对象自身的 agent + model（{id, providerID, variant}）。
         都没有 → None（unavailable）。绝不猜默认模型。
+        内部摘要/compaction 消息（synthetic/summary 标记或 agent=compaction）
+        不作为执行配置来源；会话对象回退同样拒绝，无安全完整配置则不可用。
         """
         if not session_id:
             return None
@@ -278,6 +514,12 @@ class OpenChamberClient:
         surl = f"{self.base_url}/api/session/{urllib.parse.quote(str(session_id), safe='')}"
         sstatus, sbody, _serr = self._http(surl)
         if sstatus is not None and sstatus < 400:
+            try:
+                session_response = json.loads(sbody.decode("utf-8"))
+                if isinstance(session_response, dict) and isinstance(session_response.get("data"), dict):
+                    self._modern_api = True
+            except (ValueError, UnicodeDecodeError):
+                pass
             return _config_from_session(sbody)
         return None
 
@@ -293,6 +535,8 @@ class OpenChamberClient:
         config = self.resolve_execution_config(session_id, directory)
         if config is None:
             return SendResult(False, "unavailable: 无法取得当前会话的模型配置", None)
+        if self._modern_api:
+            return self._modern_send(session_id, directory, text, config)
         message_id = self._new_message_id()
         body = {
             "messageID": message_id,
@@ -317,11 +561,27 @@ class OpenChamberClient:
     def compact_session(
         self, session_id: str, directory: str | None
     ) -> CompactResult:
-        """压缩当前会话：走 OpenChamber UI 同路径 POST /summarize。
+        """走新版 /compact；仅在端点不存在时回退旧版 /summarize。"""
+        url = (
+            f"{self.base_url}/api/session/"
+            f"{urllib.parse.quote(str(session_id), safe='')}/compact"
+        )
+        if directory:
+            url += f"?directory={urllib.parse.quote(str(directory), safe='/')}"
+        status, raw, error = self._http(url, data=b"{}")
+        if status != 404:
+            if error is not None and status is None:
+                return CompactResult(False, error)
+            if status is not None and 200 <= status < 300:
+                try:
+                    result = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    return CompactResult(False, "malformed: body is not JSON")
+                if result:
+                    return CompactResult(True, None)
+                return CompactResult(False, f"body not successful: {result!r}")
+            return CompactResult(False, f"http: {status}")
 
-        body = {providerID, modelID}，来自 resolve_execution_config。
-        成功 = HTTP 200 且 body 为 true。永不抛异常。
-        """
         config = self.resolve_execution_config(session_id, directory)
         if config is None:
             return CompactResult(False, "unavailable: 无法取得当前会话的模型配置")
@@ -377,6 +637,8 @@ class OpenChamberClient:
         新 tool part / 新 assistant message / 新 continuation 都会改变 marker。
         不依赖 assistant parentID。messages GET 失败 → read_ok=False（≠没有进度）。
         """
+        if self._modern_api:
+            return self._modern_progress(session_id, directory, user_message_id)
         status, body, error = self._http(self._messages_url(session_id, directory))
         if error is not None and status is None:
             return TaskProgressResult(False, None, False, error)
@@ -424,6 +686,8 @@ class OpenChamberClient:
         回传的答案（completed 缺失/有 error/finish 为 error|content-filter|length）。
         读取失败（status/messages GET、malformed、user_message 找不到）→ read_ok=False。
         """
+        if self._modern_api:
+            return self._modern_result(session_id, directory, user_message_id, allowed_followup_user_ids)
         allowed = {user_message_id}
         if allowed_followup_user_ids:
             allowed |= set(allowed_followup_user_ids)
@@ -498,12 +762,16 @@ class OpenChamberClient:
         if not assistants:
             return TaskResultResult(True, False, None, first_response_ms, ambiguous, False, None)
 
-        # complete：取最新一条合格的成功 assistant（finish=stop/completed 数字/无 error/非 summary/有可见 text）
+        # complete：取最新一条合格的成功 assistant。真实 OpenChamber 1.24.2 的 agent
+        # 完成回复 finish 绝大多数不是 "stop"（1216 条 assistant 仅 134 条 finish=="stop"，
+        # 常见值为 "tool-calls"/None），但都有 time.completed 数字 + 可见 text。
+        # 因此完成判定不绑定 finish=="stop"，只排除明确失败类 finish
+        # （error/content-filter/length 已在 interrupted 单独识别；这里不判完成）。
         complete = False
         text = None
         for message in reversed(assistants):
             info = message["info"]
-            if info.get("finish") != "stop":
+            if info.get("finish") in ("error", "content-filter", "length"):
                 continue
             if _num_ts(info.get("time"), "completed") is None:
                 continue
@@ -570,6 +838,8 @@ def _config_from_messages(body: bytes) -> ExecutionConfig | None:
         info = message.get("info")
         if not isinstance(info, dict) or info.get("role") != "assistant":
             continue
+        if _is_internal_summary(info):
+            continue
         agent = _nonempty_str(info.get("agent"))
         provider_id = _nonempty_str(info.get("providerID"))
         model_id = _nonempty_str(info.get("modelID"))
@@ -592,6 +862,10 @@ def _config_from_session(body: bytes) -> ExecutionConfig | None:
     except (ValueError, UnicodeDecodeError):
         return None
     if not isinstance(session, dict):
+        return None
+    if isinstance(session.get("data"), dict):
+        session = session["data"]
+    if _is_internal_summary(session):
         return None
     agent = _nonempty_str(session.get("agent"))
     model = session.get("model")
@@ -667,6 +941,14 @@ def _join_visible_text(message: dict) -> str:
 def _is_summary(info: dict) -> bool:
     """summary/continuation 合成消息判定（OpenChamber 用 synthetic 标记）。"""
     return info.get("synthetic") is True or info.get("summary") is True
+
+
+def _is_internal_summary(info: dict) -> bool:
+    """内部摘要/压缩配置判定：synthetic/summary 标记，或 agent=compaction。
+
+    这类配置不得作为 prompt_async/summarize 的执行配置来源。
+    """
+    return _is_summary(info) or _nonempty_str(info.get("agent")) == "compaction"
 
 
 if __name__ == "__main__":

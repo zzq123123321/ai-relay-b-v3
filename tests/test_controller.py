@@ -21,6 +21,7 @@ from controller import (
     AUTO_RECOVER_CHECK,
     AUTO_RESUME_SENT,
     AUTO_RUNNING,
+    AUTO_SUBMIT_UNKNOWN,
     RECOVER_OBSERVE_MS,
     RESUME_PROMPT,
     LiteController,
@@ -28,6 +29,7 @@ from controller import (
 from openchamber_client import (
     CompactResult,
     ExecutionConfig,
+    ModelTarget,
     ProbeResult,
     SendResult,
     SessionStatusResult,
@@ -158,6 +160,21 @@ def test_validate_true_returns_session():
     assert result.source == "persisted-last-active"
     assert result.error is None
 
+def test_current_session_resolves_missing_directory_from_server():
+    class ClientWithDirectory(FakeClient):
+        def resolve_session_directory(self, session_id):
+            assert session_id == "ses_x"
+            return r"C:\confirmed"
+
+    client = ClientWithDirectory(config=CFG)
+    session = ActiveSession("ses_x", None, "persisted-last-active")
+    ctrl = _ctrl(client, session)
+    result = ctrl.get_current_session()
+    assert result.valid and result.directory == r"C:\confirmed"
+    assert client.validated == [("ses_x", None)]
+    ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert client.sent[0][:2] == ("ses_x", r"C:\confirmed")
+
 
 def test_manual_send_empty_not_sent():
     client = FakeClient()
@@ -266,6 +283,80 @@ def test_receive_model_offline_wraps_and_waits():
     assert ctrl._auto_task.wrapped_text == "WRAW"
     assert ctrl._auto_task.state == "ready_to_send"
 
+def test_selected_local_model_waits_and_sends_once_after_recovery(monkeypatch):
+    client = FakeClient(config=CFG)
+    client.selected_model_target = lambda *args: ModelTarget(True, "http://192.168.100.190:8080/v1")
+    connected = [False]
+    checked = []
+    def fake_model_probe(url):
+        checked.append(url)
+        return ProbeResult(connected[0], 1, None)
+    monkeypatch.setattr("controller.probe_model_endpoint", fake_model_probe)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("local", "RAW", "W{content}")
+    assert client.sent == []
+    assert ctrl._auto_task.state == AUTO_READY
+    connected[0] = True
+    assert ctrl.watchdog_tick().action == "sent"
+    ctrl.watchdog_tick()
+    assert client.sent == [("ses_x", r"C:\work", "WRAW")]
+    assert ctrl._auto_task.local_model is True
+    assert checked == ["http://192.168.100.190:8080/v1"] * 3
+
+def test_selected_remote_model_does_not_probe_or_enter_local_recovery(monkeypatch):
+    client = FakeClient(probe_connected=False, config=CFG)
+    client.selected_model_target = lambda *args: ModelTarget(False, "https://api.example.com/v1")
+    monkeypatch.setattr("controller.probe_model_endpoint", lambda url: (_ for _ in ()).throw(AssertionError(url)))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("remote", "RAW", "")
+    assert len(client.sent) == 1
+    assert ctrl._auto_task.local_model is False
+    assert ctrl.watchdog_tick().state == AUTO_RUNNING
+    assert len(client.sent) == 1
+
+def test_selected_local_running_offline_uses_existing_recovery(monkeypatch):
+    client = FakeClient(config=CFG)
+    client.selected_model_target = lambda *args: ModelTarget(True, "http://127.0.0.1:8080/v1")
+    connected = [True]
+    monkeypatch.setattr("controller.probe_model_endpoint", lambda url: ProbeResult(connected[0], 1, None))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("local", "RAW", "")
+    connected[0] = False
+    assert ctrl.watchdog_tick().state == AUTO_MODEL_OFFLINE
+    assert len(client.sent) == 1
+    connected[0] = True
+    assert ctrl.watchdog_tick(now_ms=1000).state == AUTO_RECOVER_CHECK
+    assert len(client.sent) == 1
+
+def test_unknown_selected_provider_stays_ready_without_send():
+    client = FakeClient(config=CFG)
+    client.selected_model_target = lambda *args: None
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("unknown", "RAW", "")
+    ctrl.watchdog_tick()
+    assert ctrl._auto_task.state == AUTO_READY
+    assert client.sent == []
+
+def test_saved_model_address_is_used_after_next_controller_start(tmp_path, monkeypatch):
+    from model_probe import save_model_base_url
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    old_address = "http://127.0.0.1:18081/v1"
+    new_address = "http://192.168.100.190:8080/v1"
+    selected_addresses = []
+    client = FakeClient(config=CFG)
+    def selected_target(session_id, directory, monitored_address):
+        selected_addresses.append(monitored_address)
+        return ModelTarget(monitored_address == new_address, new_address)
+    client.selected_model_target = selected_target
+    save_model_base_url(old_address)
+    old_controller = _ctrl(client, SESSION)
+    save_model_base_url(new_address)
+    new_controller = _ctrl(client, SESSION)
+    assert old_controller.get_current_model_target() == ModelTarget(False, new_address)
+    assert new_controller.get_current_model_target() == ModelTarget(True, new_address)
+    assert selected_addresses == [old_address, new_address]
+
 
 # --- 服务在线但无 session/config：READY，send=0 ---
 def test_receive_online_no_config_waits():
@@ -314,8 +405,48 @@ def test_running_resend_no_extra_post():
     ctrl.try_send_pending_auto_task()
     assert len(client.sent) == before
 
+def test_uncertain_submit_does_not_retry_and_new_a_turn_takes_over():
+    client = FakeClient(probe_connected=True, config=CFG,
+                        send=SendResult(False, "uncertain: 提交回执未确认", None))
+    ctrl = _ctrl(client, SESSION)
+    intake = ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert intake.accepted and not intake.submitted
+    assert ctrl._auto_task.state == AUTO_SUBMIT_UNKNOWN
+    assert ctrl.auto_task_active() and ctrl.auto_task_submit_unknown()
+    ctrl.try_send_pending_auto_task()
+    assert not ctrl.receive_auto_task("e1", "RAW", "{content}").accepted
+    client.send_result = SendResult(True, None, "m2")
+    received = ctrl.receive_auto_task("e2", "OTHER", "{content}")
+    assert received.accepted and received.submitted
+    assert ctrl._auto_task.event_id == "e2"
+    assert client.sent == [("ses_x", r"C:\work", "RAW"), ("ses_x", r"C:\work", "OTHER")]
+
 
 # --- 发送失败：保持 READY，error 保存 ---
+def test_uncertain_submit_recovers_only_matching_original_message():
+    class RecoveringClient(FakeClient):
+        def confirm_uncertain_submission(self, session_id, directory, text, baseline_user_id):
+            self.confirm_calls.append((session_id, directory, text, baseline_user_id))
+            return self.confirmed_id
+
+    client = RecoveringClient(probe_connected=True, config=CFG,
+                              send=SendResult(False, "uncertain: 等待确认", None, "old", True))
+    client.confirm_calls = []
+    client.confirmed_id = None
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW", "{content}")
+    assert ctrl._auto_task.state == AUTO_SUBMIT_UNKNOWN
+    assert ctrl.watchdog_tick().action == "none"
+    assert client.sent == [("ses_x", r"C:\work", "RAW")]
+
+    client.confirmed_id = "new"
+    tick = ctrl.watchdog_tick()
+    assert tick.action == "submit_confirmed" and tick.state == AUTO_RUNNING
+    assert ctrl._auto_task.message_id == "new"
+    assert ctrl._auto_task.session_id == "ses_x"
+    assert client.confirm_calls == [("ses_x", r"C:\work", "RAW", "old")] * 2
+    assert client.sent == [("ses_x", r"C:\work", "RAW")]
+
 def test_send_failure_stays_ready_with_error():
     client = FakeClient(probe_connected=True, config=CFG, send=SendResult(False, "http: 500", None))
     ctrl = _ctrl(client, SESSION)
@@ -352,6 +483,29 @@ def test_new_task_while_running_is_busy():
 
 
 # ============================ L05-02 模型 watchdog ==========================
+
+def test_new_task_after_idle_without_old_result_starts_immediately():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(True, None, "m1"),
+                        status=SessionStatusResult(True, "idle", None))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW1", "{content}")
+
+    received = ctrl.receive_auto_task("e2", "RAW2", "{content}")
+
+    assert received.accepted and received.submitted
+    assert ctrl._auto_task.event_id == "e2"
+    assert client.sent == [("ses_x", r"C:\work", "RAW1"), ("ses_x", r"C:\work", "RAW2")]
+
+def test_new_task_does_not_replace_completed_result_awaiting_return():
+    client = FakeClient(probe_connected=True, config=CFG, send=SendResult(True, None, "m1"),
+                        status=SessionStatusResult(True, "idle", None),
+                        result=TaskResultResult(True, True, "上一轮结果", None, False, False, None))
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "RAW1", "{content}")
+
+    assert not ctrl.receive_auto_task("e2", "RAW2", "{content}").accepted
+    assert ctrl._auto_task.event_id == "e1"
+    assert client.sent == [("ses_x", r"C:\work", "RAW1")]
 
 ONLINE = dict(probe_connected=True, config=CFG)
 IDLE_ST = SessionStatusResult(True, "idle", None)
@@ -914,3 +1068,288 @@ def test_compact_auto_task_fail_keeps_task():
     assert task.session_id == "ses_x"
     assert task.message_id == "m1"
     assert task.state == AUTO_RUNNING
+
+# ===================== 阶段 3D：原任务身份解析冻结 + 回包纯封装 =====================
+
+from datetime import datetime  # noqa: E402
+
+from controller import (  # noqa: E402
+    AutoTaskIdentity,
+    parse_auto_task_identity,
+    wrap_auto_response,
+)
+
+
+def _legacy_payload(body="任务正文", task_id="task-1", extra_headers=""):
+    return (
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\n"
+        + (f"TASK_ID: {task_id}\n" if task_id else "")
+        + extra_headers
+        + f"CONTENT:\n{body}\n"
+    )
+
+
+# --- 解析：正常与默认 ---
+
+def test_parse_identity_valid_explicit_rounds():
+    id_ = parse_auto_task_identity(_legacy_payload(task_id="task-77", extra_headers="ROUND: 2\nMAX_ROUNDS: 9\n"))
+    assert id_ == AutoTaskIdentity("task-77", 2, 9, True, None)
+
+
+def test_parse_identity_defaults_round_zero_max_three():
+    id_ = parse_auto_task_identity(_legacy_payload(task_id="t1"))
+    assert id_.valid is True
+    assert (id_.task_id, id_.round_number, id_.max_rounds) == ("t1", 0, 3)
+
+
+def test_parse_identity_body_pseudo_fields_ignored():
+    # 正文里同名 TASK_ID 属正文：正常有效并绑头区原 id，不误取、不拒绝
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\nTASK_ID: orig-1\n"
+        "CONTENT:\n第一行\nTASK_ID: fake-999\nMAX_ROUNDS: 99\n正文末行\n"
+    )
+    assert id_.valid is True
+    assert (id_.task_id, id_.round_number, id_.max_rounds) == ("orig-1", 0, 3)
+
+
+def test_parse_identity_crlf_headers():
+    # CRLF 只在解析副本归一；不影响身份识别
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\r\nTARGET: EXECUTOR\r\nTYPE: TASK\r\nTASK_ID: cr-1\r\nCONTENT:\r\n正文\r\n"
+    )
+    assert id_.valid is True and id_.task_id == "cr-1"
+
+
+def test_parse_identity_nested_markers_in_body():
+    # 结果/正文自带 BEGIN/END 标记不干扰头区识别
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\nTASK_ID: nm-1\n"
+        "CONTENT:\n----- AI_RELAY_BEGIN -----\n嵌套\n----- AI_RELAY_END -----\n"
+    )
+    assert id_.valid is True and id_.task_id == "nm-1"
+
+
+# --- 解析：无效身份（不得猜 id、不得抛异常）---
+
+def test_parse_identity_missing_task_id_invalid():
+    id_ = parse_auto_task_identity(_legacy_payload(task_id=""))
+    assert id_.valid is False and "TASK_ID" in (id_.error or "")
+    assert id_.task_id == ""
+
+
+def test_parse_identity_missing_content_invalid():
+    id_ = parse_auto_task_identity("SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\nTASK_ID: t1\n")
+    assert id_.valid is False and "CONTENT" in (id_.error or "")
+
+
+def test_parse_identity_duplicate_header_invalid():
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\nTASK_ID: a\nTASK_ID: a\nCONTENT:\n正文\n"
+    )
+    assert id_.valid is False and "重复" in (id_.error or "")
+
+
+def test_parse_identity_unknown_type_invalid():
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: WEIRD\nTASK_ID: t1\nCONTENT:\n正文\n"
+    )
+    assert id_.valid is False and "类型" in (id_.error or "")
+
+
+def test_parse_identity_empty_body_invalid():
+    id_ = parse_auto_task_identity(
+        "SOURCE: CHATGPT\nTARGET: EXECUTOR\nTYPE: TASK\nTASK_ID: t1\nCONTENT:\n   \n"
+    )
+    assert id_.valid is False and "正文" in (id_.error or "")
+
+
+def test_parse_identity_bad_rounds_invalid():
+    for extra in ("ROUND: abc\n", "ROUND: -1\n", "ROUND: 5\nMAX_ROUNDS: 3\n", "MAX_ROUNDS: 0\n"):
+        id_ = parse_auto_task_identity(_legacy_payload(task_id="t1", extra_headers=extra))
+        assert id_.valid is False, extra
+        assert "ROUND" in (id_.error or "")
+
+
+# --- 接收时冻结：busy 不覆盖原身份 ---
+
+def test_receive_freezes_identity_before_wrap():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", _legacy_payload(task_id="task-42", extra_headers="ROUND: 1\nMAX_ROUNDS: 7\n"), "W{content}")
+    task = ctrl._auto_task
+    assert task.task_identity == AutoTaskIdentity("task-42", 1, 7, True, None)
+    assert task.wrapped_text.startswith("W")  # 模板包装不变
+
+
+def test_receive_busy_does_not_overwrite_identity():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", _legacy_payload(task_id="task-42"), "{content}")
+    before = ctrl._auto_task.task_identity
+    intake2 = ctrl.receive_auto_task("e2", _legacy_payload(task_id="task-99"), "{content}")
+    assert intake2.accepted is False
+    assert ctrl._auto_task.task_identity is before  # busy 拒绝，原身份不替换
+
+
+def test_identity_snapshot_by_event_id():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    assert ctrl.identity_snapshot("e1") is None  # 无任务
+    ctrl.receive_auto_task("e1", _legacy_payload(task_id="task-42"), "{content}")
+    snap = ctrl.identity_snapshot("e1")
+    assert snap is not None and snap.valid and snap.task_id == "task-42"
+    assert snap is not ctrl._auto_task  # 按值快照，不是可变 AutoTask 引用
+    assert ctrl.identity_snapshot("other") is None  # event_id 不匹配
+
+
+def test_identity_snapshot_invalid_identity_returned():
+    client = FakeClient(probe_connected=False, config=CFG)
+    ctrl = _ctrl(client, SESSION)
+    ctrl.receive_auto_task("e1", "无头区裸文本", "{content}")
+    snap = ctrl.identity_snapshot("e1")
+    assert snap is not None and snap.valid is False and snap.error
+
+
+# --- 回包纯封装（自包含固定样本；TIME 用固定 datetime 注入）---
+
+def test_wrap_response_fixed_time_format():
+    out = wrap_auto_response("结果正文", "task-42", 2, 7, now=datetime(2026, 9, 25, 12, 30, 5))
+    assert out == (
+        "----- AI_RELAY_BEGIN -----\n"
+        "SOURCE: EXECUTOR\n"
+        "TARGET: CHATGPT\n"
+        "TYPE: RESPONSE\n"
+        "TASK_ID: task-42\n"
+        "ROUND: 2\n"
+        "MAX_ROUNDS: 7\n"
+        "TIME: 2026-09-25 12:30:05\n"
+        "CONTENT:\n"
+        "结果正文\n"
+        "----- AI_RELAY_END -----"
+    )
+
+
+def test_wrap_response_preserves_body_verbatim():
+    body = "中文\n换行\t制表\r\nCRLF行\n----- AI_RELAY_BEGIN -----\n嵌套"
+    out = wrap_auto_response(body, "t1", 0, 3, now=datetime(2026, 1, 1))
+    assert f"CONTENT:\n{body}\n----- AI_RELAY_END -----" in out  # 不 strip、不统一 CRLF、不 extract
+
+
+def test_wrap_response_failures_return_none():
+    assert wrap_auto_response("", "t1", 0, 3) is None
+    assert wrap_auto_response("   ", "t1", 0, 3) is None
+    assert wrap_auto_response(None, "t1", 0, 3) is None
+    assert wrap_auto_response("x", "", 0, 3) is None
+    assert wrap_auto_response("x", "  ", 0, 3) is None
+    assert wrap_auto_response("x", "t1", 1, 0) is None  # MAX_ROUNDS < 1
+    assert wrap_auto_response("x", "t1", 5, 3) is None  # ROUND > MAX
+    assert wrap_auto_response("x", "t1", -1, 3) is None
+
+# ===================== 阶段 3D-2：非法字段安全处理 + 头区分行兼容 =====================
+
+import pytest  # noqa: E402
+
+from controller import is_usable_identity  # noqa: E402
+
+
+# --- 头区分行语义对齐旧版 splitlines（重复头/伪造行判定一致）---
+
+@pytest.mark.parametrize("sep", ["\r\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\u0085", "\u2028", "\u2029"])
+def test_parse_duplicate_header_across_all_splitlines_separators(sep):
+    # 旧版 splitlines 会把 TASK_ID: original{sep}TASK_ID: injected 拆成两行 → 重复头拒绝
+    payload = f"SOURCE: A\nTARGET: B\nTYPE: TASK\nTASK_ID: original{sep}TASK_ID: injected\nCONTENT:\n正文\n"
+    id_ = parse_auto_task_identity(payload)
+    assert id_.valid is False
+    assert "重复" in (id_.error or "")
+    assert "injected" not in (id_.task_id or "")
+
+
+@pytest.mark.parametrize("sep", ["\r", "\v", "\f", "\u2028"])
+def test_parse_fake_content_line_not_misrejected(sep):
+    # CONTENT 之后的同名行属正文（与旧版一致）：不误切、不误拒，合法样本成功
+    payload = f"SOURCE: A\nTARGET: B\nTYPE: TASK\nTASK_ID: t1\nCONTENT:{sep}CONTENT: fake\n正文\n"
+    id_ = parse_auto_task_identity(payload)
+    assert id_.valid is True
+    assert id_.task_id == "t1"
+
+
+def test_parse_case_variant_content_in_header_zone():
+    # 头区大小写变体 content: 行即切换正文（旧版同义）；后续 CONTENT: 行属正文
+    payload = "SOURCE: A\nTARGET: B\nTYPE: TASK\nTASK_ID: t1\ncontent: junk\u2028CONTENT: real\n正文\n"
+    id_ = parse_auto_task_identity(payload)
+    assert id_.valid is True
+    assert id_.task_id == "t1"
+
+
+def test_parse_body_pseudo_fields_with_control_chars_still_valid():
+    # 正文内控制字符/同名字段/嵌套标记原样保留，合法样本成功（不误拒）
+    payload = (
+        "SOURCE: A\nTARGET: B\nTYPE: TASK\nTASK_ID: keep-1\n"
+        "CONTENT:\n行一\vTASK_ID: fake\x0c行二\n----- AI_RELAY_BEGIN -----\n嵌套\u2028标记\n"
+    )
+    id_ = parse_auto_task_identity(payload)
+    assert id_.valid is True
+    assert id_.task_id == "keep-1"
+    assert (id_.round_number, id_.max_rounds) == (0, 3)
+
+
+def test_parse_non_string_payload_invalid_no_raise():
+    id_ = parse_auto_task_identity(123)
+    assert id_.valid is False and id_.error
+    assert parse_auto_task_identity(None).valid is False
+
+
+# --- 纯封装对约定范围外输入安全失败（不抛异常、不输出额外头行/True 轮次）---
+
+def test_wrap_bool_rounds_rejected():
+    assert wrap_auto_response("x", "t1", True, 3) is None
+    assert wrap_auto_response("x", "t1", 0, False) is None
+    assert wrap_auto_response("x", "t1", True, True) is None
+
+
+def test_wrap_non_string_body_rejected():
+    assert wrap_auto_response(123, "t", 0, 3) is None
+    assert wrap_auto_response(["x"], "t", 0, 3) is None
+
+
+def test_wrap_task_id_with_line_breaks_rejected():
+    # 手工构造含头行分隔符的 id 不得输出能拆成额外头行的 TASK_ID 行
+    for bad in ("t1\nX: 1", "t1\vX: 1", "t1\rX", "t1\u2028X", "t1\u0085X"):
+        assert wrap_auto_response("x", bad, 0, 3) is None, repr(bad)
+
+
+def test_wrap_identity_with_newline_id_full_packet_rejected():
+    out = wrap_auto_response("x", "t\nSOURCE: HIJACK", 2, 9)
+    assert out is None
+
+
+# --- GUI 封装前严格身份校验（is_usable_identity）---
+
+def test_parse_v1_task_identity():
+    payload = (
+        "AI_RELAY/1\nMESSAGE_ID: msg-1\nSOURCE: CHATGPT\nTARGET: EXECUTOR\n"
+        "TYPE: TASK\nTASK_ID: task-1\nROUND: 1\nMAX_ROUNDS: 3\nCONTENT:\nwork\n"
+    )
+    identity = parse_auto_task_identity(payload)
+    assert identity.valid
+    assert (identity.task_id, identity.round_number, identity.max_rounds) == ("task-1", 1, 3)
+
+def test_is_usable_identity_valid_object():
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, 3, True, None)) is True
+    assert is_usable_identity(AutoTaskIdentity("t1", 2, 9, True, None)) is True
+
+
+def test_is_usable_identity_rejects_wrong_shapes():
+    assert is_usable_identity({}) is False  # identity={}
+    assert is_usable_identity(None) is False
+    assert is_usable_identity("t1") is False
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, 3, "yes")) is False  # valid 非布尔真
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, 3, "no")) is False
+    assert is_usable_identity(AutoTaskIdentity("", 0, 3, True, None)) is False  # 空 id
+    assert is_usable_identity(AutoTaskIdentity(123, 0, 3, True, None)) is False  # id 非字符串
+    assert is_usable_identity(AutoTaskIdentity("t1", True, 3, True, None)) is False  # bool 轮次
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, False, True, None)) is False
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, "3", True, None)) is False  # 非整数
+    assert is_usable_identity(AutoTaskIdentity("t1", 0, 0, True, None)) is False  # MAX<1
+    assert is_usable_identity(AutoTaskIdentity("t1", 5, 3, True, None)) is False  # ROUND>MAX
+    assert is_usable_identity(AutoTaskIdentity("", 0, 0, False, "缺少头部：TASK_ID")) is False

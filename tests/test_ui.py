@@ -1,18 +1,18 @@
-"""AI Relay B Lite 单页 UI 骨架测试（offscreen，不起真实服务、不 import OpenChamberClient）。
+"""AI Relay B Lite 三页 UI 骨架测试（阶段 2C，offscreen，不起真实服务、不 import OpenChamberClient）。
 
 覆盖任务要求 12 项：
- 1 窗口可构造（标题/默认尺寸）
- 2 页面不存在 Agent/Model/工作目录 等禁止控件
- 3 A端连接、大模型连接两个状态区存在
- 4 当前会话控件存在
- 5 自动压缩是可勾选控件
- 6 手动输入框存在
- 7 发送按钮触发 manual_send_requested 且文本不修改
- 8 Ctrl+Enter 触发同一 signal
- 9 开始监听 ↔ 停止监听切换正确
- 10 包装内容弹窗可打开
- 11 总指挥模板弹窗可打开（含关键内容）
- 12 总指挥模板“填入发送框”不自动发送
+  1 窗口可构造（标题/默认尺寸 720×640）
+  2 页面不存在 Agent/Model/工作目录 等禁止控件
+  3 A端连接、大模型连接两个状态区存在
+  4 当前会话控件存在
+  5 自动压缩是可勾选控件
+  6 手动输入框存在
+  7 发送按钮触发 manual_send_requested 且文本不修改
+  8 Ctrl+Enter 触发同一 signal
+  9 开始监听 ↔ 停止监听切换正确
+  10 包装内容按钮发即时包装信号；不提供包装模板编辑入口
+  11 首页总指挥模板入口跳转第三页模板编辑区（含关键内容）
+  12 总指挥模板“填入发送框”不自动发送、自动回主控
 """
 
 import os
@@ -24,13 +24,12 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QDialog,
     QLabel,
     QPlainTextEdit,
     QPushButton,
 )
 
-from ui.main_window import CommanderDialog, MainWindow, WrapperDialog
+from ui.main_window import MainWindow
 
 FORBIDDEN = ["Agent", "Model", "工作目录", "Reasonix", "FIXED_SESSION", "PROJECT_ROTATING"]
 
@@ -63,8 +62,8 @@ def _visible_texts(w) -> str:
 def test_window_constructs(qapp):
     w = MainWindow()
     assert w.windowTitle() == "AI Relay B Lite"
-    assert w.width() == 900
-    assert w.height() == 760
+    assert w.width() == 720
+    assert w.height() == 640
     assert issubclass(type(w), MainWindow)
     w.close()
 
@@ -160,31 +159,29 @@ def test_set_listening_false(win):
     assert fired == [False]
 
 
-def test_wrapper_dialog_opens(win):
-    dlg = win.findChild(QDialog, "wrapper_dialog")
-    assert isinstance(dlg, WrapperDialog)
-    assert dlg.isHidden()
+def test_wrap_button_no_dialog_emits_signal(win):
+    assert win.findChild(QPushButton, "btn_wrapper_edit") is None
+    fired = []
+    win.wrap_clipboard_requested.connect(lambda: fired.append(1))
     win.findChild(QPushButton, "btn_wrapper").click()
-    assert not dlg.isHidden()
+    assert fired == [1]
 
-
-def test_commander_dialog_opens(win):
-    dlg = win.findChild(QDialog, "commander_dialog")
-    assert isinstance(dlg, CommanderDialog)
-    assert dlg.isHidden()
+def test_commander_entry_jumps_to_template_page(win):
+    """首页“项目总指挥模板”入口跳转第三页项目模板编辑区（2C 起不再是弹窗）。"""
     win.findChild(QPushButton, "btn_commander").click()
-    assert not dlg.isHidden()
-    txt = dlg.findChild(QPlainTextEdit, "commander_edit").toPlainText()
+    assert win._main_tabs.currentWidget() is win._page_templates
+    assert win._tpl_tabs.currentIndex() == 0
+    txt = win.findChild(QPlainTextEdit, "commander_edit").toPlainText()
     assert "总指挥" in txt
     assert "AI_RELAY_COMPLETE" in txt
 
 
 def test_commander_fill_no_autosend(win):
-    dlg = win.findChild(QDialog, "commander_dialog")
-    edit = dlg.findChild(QPlainTextEdit, "commander_edit")
+    edit = win.findChild(QPlainTextEdit, "commander_edit")
     edit.setPlainText("自定义总指挥指令 123")
     sends = []
     win.manual_send_requested.connect(sends.append)
-    dlg.findChild(QPushButton, "commander_fill").click()
+    win.findChild(QPushButton, "commander_fill").click()
     assert win.findChild(QPlainTextEdit, "manual_input").toPlainText() == "自定义总指挥指令 123"
     assert sends == []  # 只写入手动框，未自动发送
+    assert win._main_tabs.currentWidget() is win._page_main  # 填入后自动回主控

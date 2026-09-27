@@ -11,20 +11,25 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from auto_monitor import AutoMonitor
-from controller import AUTO_RUNNING, AutoTaskIntake, WatchdogTick
+from controller import AUTO_RUNNING, AutoTaskIdentity, AutoTaskIntake, WatchdogTick
 from openchamber_client import CompactResult, TaskResultResult
+
+VALID_ID = AutoTaskIdentity("task-1", 0, 3, True, None)
+INVALID_ID = AutoTaskIdentity("", 0, 0, False, "缺少头部：TASK_ID")
 
 
 class FakeMonitorController:
-    """LiteController 替身：只实现 AutoMonitor 依赖的 6 个方法，全部可脚本化。"""
+    """LiteController 替身：只实现 AutoMonitor 依赖的 7 个方法，全部可脚本化。"""
 
     def __init__(self, intake=None, tick_action="none", result=None, begin_ok=True,
-                 compact=None) -> None:
+                 compact=None, identity=None) -> None:
         self.intake = intake
         self.tick_action = tick_action
         self.result = result
         self.begin_ok = begin_ok
         self.compact_result = compact if compact is not None else CompactResult(True, None)
+        self.identity = identity if identity is not None else VALID_ID
+        self.identity_calls: list[str | None] = []
         self.receive_calls: list[tuple[str, str, str]] = []
         self.finish_calls: list[str] = []
         self.compact_calls: list[str] = []
@@ -71,6 +76,12 @@ class FakeMonitorController:
     def compact_auto_task(self, event_id):
         self.compact_calls.append(event_id)
         return self.compact_result
+
+    def identity_snapshot(self, event_id):
+        self.identity_calls.append(event_id)
+        if event_id == self._event_id:
+            return self.identity
+        return None
 
 
 def _types(monitor) -> list[str]:
@@ -126,6 +137,9 @@ def test_watchdog_action_maps_to_event():
     fc.tick_action = "resume_sent"
     mon.run_once()
     assert _types(mon) == ["resume_sent"]
+    fc.tick_action = "submit_confirmed"
+    mon.run_once()
+    assert _types(mon) == ["submit_confirmed"]
 
 
 # 11. first_response_ms 只发一次（后续轮询不重复）
@@ -160,8 +174,33 @@ def test_result_complete_once_no_repeat_before_ack():
     assert fc.inspect_calls == 1
 
 
-# 13. ack 后调用 finish_auto_task → 下一任务可接收
-def test_ack_releases_and_allows_next():
+# 12b. result_complete 携带与 event_id 匹配的冻结身份快照（不可变值，非 AutoTask 引用）
+def test_result_complete_carries_frozen_identity_snapshot():
+    done = TaskResultResult(True, True, "DONE", 100, False, False, None)
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=done, identity=VALID_ID)
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    evs = [e for e in mon.drain_events() if e["type"] == "result_complete"]
+    assert len(evs) == 1
+    assert evs[0]["event_id"] == "e1"
+    assert evs[0]["identity"] is VALID_ID  # 按值传递的不可变快照
+    assert evs[0]["identity"].task_id == "task-1"
+    assert fc.identity_calls == ["e1"]  # 与 event_id 匹配查询，不查别的任务
+
+
+# 12c. 身份无效：result_complete 仍发出（原始结果交 GUI 展示），身份快照如实携带
+def test_result_complete_invalid_identity_still_emitted():
+    done = TaskResultResult(True, True, "DONE", 100, False, False, None)
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=done, identity=INVALID_ID)
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}")
+    mon.run_once()
+    evs = [e for e in mon.drain_events() if e["type"] == "result_complete"]
+    assert len(evs) == 1
+    assert evs[0]["text"] == "DONE"  # 原始结果不丢
+    assert evs[0]["identity"].valid is False
+    assert evs[0]["identity"].error == "缺少头部：TASK_ID"
     done = TaskResultResult(True, True, "DONE", 100, False, False, None)
     fc = FakeMonitorController(intake=AutoTaskIntake(True, True), result=done)
     mon = AutoMonitor(fc, 0.01)
@@ -208,6 +247,20 @@ def test_interrupted_triggers_begin_no_result_complete():
     assert fc.begin_calls >= 1  # 触发了 begin_interrupted_recovery
     assert "result_complete" not in evs
     assert "result_ambiguous" not in evs
+
+def test_remote_interrupted_is_visible_and_never_auto_resumed():
+    interrupted = TaskResultResult(True, False, None, None, False, True, None)
+    controller = FakeMonitorController(intake=AutoTaskIntake(True, True), result=interrupted)
+    controller.auto_task_is_local = lambda: False
+    monitor = AutoMonitor(controller, 0.01)
+    monitor.submit_remote_task("e1", "x", "{content}")
+    monitor.run_once()
+    monitor.run_once()
+    assert _types(monitor).count("result_interrupted") == 1
+    monitor.run_once()
+    assert _types(monitor) == []
+    assert controller.begin_calls == 0
+    assert controller.finish_calls == []
 
 
 # 15. ambiguous → 不产生 result_complete，只发一次冲突事件
@@ -423,6 +476,38 @@ def test_interrupted_no_auto_compact():
     mon.drain_events()
     assert fc.compact_calls == []
     assert fc.finish_calls == []
+
+
+# 阶段 3F-2：接管回执携带 event_id + 内部 attempt 令牌
+def test_3f2_receipts_carry_event_id_and_attempt():
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, True))
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}", attempt=3)
+    mon.run_once()
+    ev = [e for e in mon.drain_events() if e["type"] == "intake_running"][0]
+    assert ev["event_id"] == "e1"
+    assert ev["attempt"] == 3  # 令牌原样带回，GUI 匹配对应投递轮
+
+
+def test_3f2_busy_receipt_carry_event_id_and_attempt():
+    fc = FakeMonitorController(intake=AutoTaskIntake(False, False))
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}", attempt=2)
+    mon.run_once()
+    ev = [e for e in mon.drain_events() if e["type"] == "intake_busy"][0]
+    assert ev["event_id"] == "e1"
+    assert ev["attempt"] == 2
+
+
+def test_3f2_direct_submit_without_attempt_still_compatible():
+    """既有无令牌直接调用（attempt=None）：回执 attempt=None，按 event_id 匹配兼容。"""
+    fc = FakeMonitorController(intake=AutoTaskIntake(True, False))
+    mon = AutoMonitor(fc, 0.01)
+    mon.submit_remote_task("e1", "x", "{content}")  # 3 参旧签名
+    mon.run_once()
+    ev = [e for e in mon.drain_events() if e["type"] == "intake_ready"][0]
+    assert ev["event_id"] == "e1"
+    assert ev["attempt"] is None
 
 
 if __name__ == "__main__":

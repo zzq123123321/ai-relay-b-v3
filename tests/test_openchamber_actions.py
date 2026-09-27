@@ -250,8 +250,43 @@ def test_send_text_unavailable_config(monkeypatch, tmp_path):
 # --- 交付3：compact_session ----------------------------------------------
 
 
+def _missing_compact(request):
+    raise urllib.error.HTTPError(request.full_url, 404, "nf", {}, io.BytesIO(b""))
+
+
+def test_compact_modern_endpoint(monkeypatch, tmp_path):
+    client, calls = _client(monkeypatch, tmp_path, [
+        ("/compact", lambda request: FakeResponse(200, b'{"sessionID":"ses_x"}')),
+    ])
+    result = client.compact_session("ses_x", "D:/work")
+    assert result == CompactResult(True, None)
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][1].endswith("/compact?directory=D%3A/work")
+    assert json.loads(calls[0][2]) == {}
+
+
+def test_compact_modern_rejected_without_legacy_retry(monkeypatch, tmp_path):
+    client, calls = _client(monkeypatch, tmp_path, [
+        ("/compact", lambda request: FakeResponse(200, b"false")),
+    ])
+    result = client.compact_session("ses_x", None)
+    assert result.success is False
+    assert len(calls) == 1
+
+
+def test_compact_modern_server_error_without_legacy_retry(monkeypatch, tmp_path):
+    def server_error(request):
+        raise urllib.error.HTTPError(request.full_url, 500, "ise", {}, io.BytesIO(b""))
+
+    client, calls = _client(monkeypatch, tmp_path, [("/compact", server_error)])
+    assert client.compact_session("ses_x", None).error == "http: 500"
+    assert len(calls) == 1
+
+
 def test_compact_body_exact(monkeypatch, tmp_path):
     client, calls = _client(monkeypatch, tmp_path, [
+        ("/compact", _missing_compact),
         _messages_route(variant="平均"),
         ("/summarize", lambda r: FakeResponse(200, b"true")),
     ])
@@ -267,6 +302,7 @@ def test_compact_body_exact(monkeypatch, tmp_path):
 
 def test_compact_200_true_success(monkeypatch, tmp_path):
     client, _ = _client(monkeypatch, tmp_path, [
+        ("/compact", _missing_compact),
         _messages_route(),
         ("/summarize", lambda r: FakeResponse(200, b"true")),
     ])
@@ -275,6 +311,7 @@ def test_compact_200_true_success(monkeypatch, tmp_path):
 
 def test_compact_200_false_failure(monkeypatch, tmp_path):
     client, _ = _client(monkeypatch, tmp_path, [
+        ("/compact", _missing_compact),
         _messages_route(),
         ("/summarize", lambda r: FakeResponse(200, b"false")),
     ])
@@ -287,7 +324,7 @@ def test_compact_http_error_failure(monkeypatch, tmp_path):
     def raise_500(request):
         raise urllib.error.HTTPError(request.full_url, 500, "ise", {}, io.BytesIO(b""))
 
-    client, _ = _client(monkeypatch, tmp_path, [_messages_route(), ("/summarize", raise_500)])
+    client, _ = _client(monkeypatch, tmp_path, [("/compact", _missing_compact), _messages_route(), ("/summarize", raise_500)])
     result = client.compact_session("ses_x", None)
     assert result.success is False
     assert result.error == "http: 500"
@@ -295,6 +332,7 @@ def test_compact_http_error_failure(monkeypatch, tmp_path):
 
 def test_compact_malformed_body_failure(monkeypatch, tmp_path):
     client, _ = _client(monkeypatch, tmp_path, [
+        ("/compact", _missing_compact),
         _messages_route(),
         ("/summarize", lambda r: FakeResponse(200, b"not-json")),
     ])
